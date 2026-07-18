@@ -53,7 +53,7 @@ world by a bridge container.
 
 Do not wire everything at once. Each phase gives you a working checkpoint.
 
-### Phase 0: OPC UA with no hardware (1 evening)
+### Phase 0: OPC UA with no hardware
 Prove the backbone with pure software before the arm arrives.
 
 1. On any machine, `pip install asyncua`.
@@ -65,7 +65,7 @@ Prove the backbone with pure software before the arm arrives.
 You now understand nodes, namespaces, and subscriptions, which is 80 percent of
 OPC UA.
 
-### Phase 1: Two-node k3s cluster (half a day)
+### Phase 1: Two-node k3s cluster
 1. On the Spark, install the k3s server:
    `curl -sfL https://get.k3s.io | sh -`
 2. Grab the join token from the Spark:
@@ -80,7 +80,7 @@ OPC UA.
    kubectl label node <spark-hostname> role=edge
    ```
 
-### Phase 2: Real arm behind the OPC UA server (1 to 2 days)
+### Phase 2: Real arm behind the OPC UA server
 1. Wire the arm to the Pi over USB. Find the device with `ls /dev/ttyUSB*` or
    `dmesg`.
 2. Extend your Phase 0 server: instead of fake values, read the real joint
@@ -91,7 +91,7 @@ OPC UA.
 4. Containerize the server and push the image to a registry the cluster can
    reach (a local registry is fine).
 
-### Phase 3: AI on the Spark (2 to 3 days)
+### Phase 3: AI on the Spark
 1. Write the OPC UA client that subscribes to the arm state on the Spark.
 2. Feed the state (plus a camera stream if you add one) into a model. Good
    starter tasks: predict a collision, classify a grasp, or run a small
@@ -100,7 +100,7 @@ OPC UA.
 4. Optionally add a second OPC UA server that publishes the AI results, so a
    dashboard or MES stand-in can consume them through the same backbone.
 
-### Phase 4: ROS 2 bridge and orchestration (2 to 3 days)
+### Phase 4: ROS 2 bridge and orchestration
 1. Add ROS 2 nodes for the control side and bridge them to OPC UA.
 2. Apply the manifests (see the companion file `k3s-opcua-stack.yaml`) so k3s
    runs and heals every container.
