@@ -24,7 +24,7 @@ the Spark and one pubsub_agent per robot on its Pi.
 |                  |   (client)    |  | spark-gateway (gateway.py)   |  |
 +------------------+               |  | - Single OPC UA endpoint     |  |
                                    |  |   opc.tcp://<spark>:4840/    |  |
-                                   |  | - OPC UA<->MQTT bridge        |  |
+                                   |  | - OPC UA PubSub / MQTT       |  |
                                    |  +------------------------------+  |
                                    +------------------------------------+
                                                   |
@@ -64,7 +64,7 @@ docs/              architecture notes, getting-started guide, design sketches
 |---|---|---|
 | `servo_driver.py` | Pi | Drives SG90 servos via pigpio (DMA PWM), mock fallback |
 | `pubsub_agent.py` | Pi | Publishes state and subscribes to commands over MQTT, local safe-stop |
-| `gateway.py` | DGX Spark | One OPC UA endpoint for the fleet, bridged to MQTT |
+| `gateway.py` | DGX Spark | One OPC UA endpoint for the fleet, OPC UA PubSub over MQTT |
 | `k3s-opcua-stack.yaml` | cluster | Deploys and heals the containers, pins them by node label |
 
 ## Quick start (no hardware needed)
@@ -172,8 +172,14 @@ for the design rationale.
 
 ## Standards note
 
-The fleet gateway implements the OPC UA PubSub pattern pragmatically: an asyncua
-OPC UA server for the OT-facing side plus paho MQTT as the broker transport. A
-fully spec-compliant OPC UA PubSub deployment would use a PubSub-capable stack
-such as open62541 end to end. The topology and address space are the same either
-way.
+The gateway and agents exchange OPC UA PubSub JSON NetworkMessages conforming to
+OPC UA Part 14 (JSON message mapping) over the MQTT transport—one of the standard
+OPC UA PubSub transports. The encoding is the official OPC UA PubSub JSON format:
+NetworkMessage with MessageType "ua-data" carrying DataSetMessages whose Payload
+fields are DataValue/Variant-encoded (e.g. Double type id 11 is represented as
+`{"Value":{"Type":11,"Body":90.0}}`). asyncua provides the OPC UA client/server
+(north/OT-facing) endpoint; paho-mqtt provides the broker transport; the
+on-the-wire PubSub message format itself—the JSON NetworkMessage—is the
+standardized OPC UA encoding, implemented in the shared `ua_pubsub.py` codec.
+open62541 is an alternative full-stack option, but this repo is fully spec-compliant
+for PubSub over MQTT.

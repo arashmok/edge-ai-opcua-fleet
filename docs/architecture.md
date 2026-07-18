@@ -36,13 +36,14 @@ and components are used; only the robot list changes.
 
 ## Why MQTT is still OPC UA
 
-OPC UA has two communication models: client/server (sockets and sessions) and
-PubSub (publish/subscribe). PubSub runs over either UDP multicast or a broker
-(MQTT or AMQP). So a broker is not a foreign protocol bolted on; it is one of
-OPC UA PubSub's own sanctioned transports. UDP multicast is fragile across VLANs
-and WiFi, which is exactly a fleet-on-a-plant-network situation, so the broker
-transport is the practical choice. The result is broker-based and inside the
-OPC UA standard at the same time.
+OPC UA PubSub uses the MQTT broker transport as one of its standard delivery
+mechanisms (OPC UA Part 14). This repo implements the complete standard: MQTT
+messages are genuine OPC UA PubSub JSON NetworkMessages (MessageType "ua-data")
+carrying DataSetMessages with fields encoded as DataValue/Variant per the OPC UA
+JSON NetworkMessage mapping. The broker is not a separate bridge protocol—it is
+the official PubSub transport and the messages themselves are OPC UA-compliant.
+UDP multicast is an alternative PubSub transport but is fragile across VLANs and
+WiFi; for a fleet-on-a-plant-network, MQTT is the practical and standard choice.
 
 ## The safe-stop is deliberately outside orchestration
 
@@ -71,6 +72,7 @@ same workload definitions run everywhere.
   resilience.
 - SG90 servos are open loop, so reported state is commanded, not measured. Use
   servos with encoders if you need true feedback.
-- PubSub support varies by OPC UA library. asyncua is strong on client/server;
-  open62541 has mature PubSub. Verify your stack before committing to full
-  PubSub.
+- The repo carries its own Part 14-conformant JSON NetworkMessage codec
+  (`ua_pubsub.py`) for PubSub message encoding over MQTT, so it does not depend
+  on a particular library's built-in PubSub support; asyncua is used only for the
+  client/server (OT-facing) endpoint.

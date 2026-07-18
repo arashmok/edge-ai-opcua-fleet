@@ -1,0 +1,191 @@
+"""
+pytest suite for the OPC UA PubSub JSON NetworkMessage codec (OPC UA Part 14).
+
+The codec module lives at spark-gateway/ua_pubsub.py (an identical copy exists at
+pi-agent/ua_pubsub.py). We add the spark-gateway directory to sys.path so
+`import ua_pubsub` resolves to that copy.
+"""
+
+import json
+import sys
+import os
+
+# Put the spark-gateway source dir on the path so `import ua_pubsub` works.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "spark-gateway"))
+
+import ua_pubsub  # noqa: E402  (import after sys.path tweak)
+from ua_pubsub import (  # noqa: E402
+    DSW_STATE,
+    DSW_COMMAND,
+    BUILTIN_DOUBLE,
+    BUILTIN_BOOLEAN,
+    variant,
+    data_value,
+    build_network_message,
+    encode,
+    decode,
+)
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+def test_constants_have_expected_values():
+    assert DSW_STATE == 1
+    assert DSW_COMMAND == 2
+    assert BUILTIN_DOUBLE == 11
+    assert BUILTIN_BOOLEAN == 1
+
+
+# ---------------------------------------------------------------------------
+# variant / data_value helpers
+# ---------------------------------------------------------------------------
+def test_variant_structure():
+    assert variant(90.0, BUILTIN_DOUBLE) == {"Type": 11, "Body": 90.0}
+    assert variant(True, BUILTIN_BOOLEAN) == {"Type": 1, "Body": True}
+
+
+def test_data_value_structure():
+    dv = data_value(90.0, BUILTIN_DOUBLE)
+    assert dv == {"Value": {"Type": 11, "Body": 90.0}}
+
+
+# ---------------------------------------------------------------------------
+# 1. build_network_message structure
+# ---------------------------------------------------------------------------
+def test_build_network_message_structure():
+    msg = build_network_message(
+        "arm1", DSW_STATE, 42, {"base": 90.0, "pitch": 120.0}
+    )
+    # top-level
+    assert msg["MessageType"] == "ua-data"
+    assert isinstance(msg["MessageId"], str) and len(msg["MessageId"]) > 0
+    assert msg["PublisherId"] == "arm1"
+    assert isinstance(msg["Messages"], list) and len(msg["Messages"]) == 1
+
+    ds = msg["Messages"][0]
+    assert ds["DataSetWriterId"] == 1
+    assert ds["SequenceNumber"] == 42
+    assert ds["MetaDataVersion"] == {"MajorVersion": 1, "MinorVersion": 0}
+    assert ds["Status"] == 0
+    assert isinstance(ds["Timestamp"], str) and len(ds["Timestamp"]) > 0
+
+    payload = ds["Payload"]
+    assert payload["base"] == {"Value": {"Type": 11, "Body": 90.0}}
+    assert payload["pitch"] == {"Value": {"Type": 11, "Body": 120.0}}
+
+
+# ---------------------------------------------------------------------------
+# 2. bool fields encode as Boolean type id 1
+# ---------------------------------------------------------------------------
+def test_bool_field_encodes_as_boolean():
+    msg = build_network_message("arm1", DSW_STATE, 1, {"safe_stop": True})
+    dv = msg["Messages"][0]["Payload"]["safe_stop"]
+    assert dv == {"Value": {"Type": 1, "Body": True}}
+
+
+# ---------------------------------------------------------------------------
+# 3. encode() returns valid JSON matching build_network_message
+# ---------------------------------------------------------------------------
+def test_encode_returns_valid_json_roundtrip():
+    raw = encode("arm1", DSW_STATE, 42, {"base": 90.0, "pitch": 120.0})
+    assert isinstance(raw, str)
+    parsed = json.loads(raw)
+    built = build_network_message("arm1", DSW_STATE, 42, {"base": 90.0, "pitch": 120.0})
+    # The Timestamp and MessageId are generated, so compare structurally field by
+    # field rather than full-equality. Everything except the generated ids/ts must
+    # match exactly.
+    assert parsed["MessageType"] == built["MessageType"] == "ua-data"
+    assert parsed["PublisherId"] == built["PublisherId"] == "arm1"
+    assert isinstance(parsed["MessageId"], str)
+    p_ds = parsed["Messages"][0]
+    b_ds = built["Messages"][0]
+    assert p_ds["DataSetWriterId"] == b_ds["DataSetWriterId"] == 1
+    assert p_ds["SequenceNumber"] == b_ds["SequenceNumber"] == 42
+    assert p_ds["MetaDataVersion"] == b_ds["MetaDataVersion"]
+    assert p_ds["Status"] == b_ds["Status"] == 0
+    assert isinstance(p_ds["Timestamp"], str)
+    assert p_ds["Payload"] == b_ds["Payload"]
+
+
+# ---------------------------------------------------------------------------
+# 4. Round trip through encode/decode
+# ---------------------------------------------------------------------------
+def test_decode_roundtrip_unwraps_values():
+    raw = encode("arm1", DSW_STATE, 7, {"base": 90.0, "pitch": 45.5})
+    out = decode(raw)
+    assert out["publisher_id"] == "arm1"
+    assert out["message_type"] == "ua-data"
+    assert isinstance(out["datasets"], list) and len(out["datasets"]) == 1
+    ds = out["datasets"][0]
+    assert ds["writer_id"] == 1
+    assert ds["sequence_number"] == 7
+    assert ds["fields"] == {"base": 90.0, "pitch": 45.5}
+
+
+# ---------------------------------------------------------------------------
+# 5. decode raises ValueError on malformed / non-ua-data
+# ---------------------------------------------------------------------------
+def test_decode_invalid_json_raises_valueerror():
+    try:
+        decode("{not json")
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+
+
+def test_decode_non_ua_data_raises_valueerror():
+    bad = {"MessageType": "ua-metadata", "PublisherId": "x", "Messages": []}
+    try:
+        decode(json.dumps(bad))
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# 6. decode is defensive about bare-number payload fields
+# ---------------------------------------------------------------------------
+def test_decode_handles_bare_payload_value():
+    # Hand-construct a message whose Payload field is a bare number (not wrapped
+    # in the DataValue/Variant form).
+    msg = {
+        "MessageId": "id-1",
+        "MessageType": "ua-data",
+        "PublisherId": "arm1",
+        "Messages": [
+            {
+                "DataSetWriterId": 1,
+                "SequenceNumber": 1,
+                "MetaDataVersion": {"MajorVersion": 1, "MinorVersion": 0},
+                "Timestamp": "2024-01-01T00:00:00+00:00",
+                "Status": 0,
+                "MessageType": "ua-keyframe",
+                "Payload": {"base": 90.0},
+            }
+        ],
+    }
+    out = decode(json.dumps(msg))
+    assert out["datasets"][0]["fields"] == {"base": 90.0}
+
+
+# ---------------------------------------------------------------------------
+# 7. Command-direction round trip (DSW_COMMAND)
+# ---------------------------------------------------------------------------
+def test_command_direction_roundtrip():
+    raw = encode("fleet-gateway", DSW_COMMAND, 3, {"base": 120.0})
+    out = decode(raw)
+    assert out["publisher_id"] == "fleet-gateway"
+    assert out["message_type"] == "ua-data"
+    assert out["datasets"][0]["writer_id"] == DSW_COMMAND == 2
+    assert out["datasets"][0]["sequence_number"] == 3
+    assert out["datasets"][0]["fields"] == {"base": 120.0}
+
+
+# ---------------------------------------------------------------------------
+# 8. decode accepts bytes too
+# ---------------------------------------------------------------------------
+def test_decode_accepts_bytes():
+    raw = encode("arm1", DSW_STATE, 1, {"base": 1.0})
+    out = decode(raw.encode("utf-8"))
+    assert out["datasets"][0]["fields"] == {"base": 1.0}

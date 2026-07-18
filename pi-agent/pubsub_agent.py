@@ -12,8 +12,7 @@ OPC UA PubSub. Each robot:
 This keeps robots socket-free (they never listen for inbound connections) and
 lets the fleet scale: a new robot just picks a new robot_id.
 
-Command payload example:  {"base": 90, "pitch": 120, "safe_stop": false}
-State payload example:    {"robot_id": "arm1", "joints": {"base": 90, ...}, "ts": 172...}
+State/command messages are OPC UA PubSub JSON NetworkMessages (OPC UA Part 14).
 
 Env (all optional):
   ROBOT_ID       default "arm1"
@@ -118,6 +117,23 @@ class Agent:
         try:
             self.publish_loop()
         except KeyboardInterrupt:
+            log.info("shutting down")
+            self.driver.release_all()
+
+
+if __name__ == "__main__":
+    Agent().run()
+TOPIC, STATE_TOPIC)
+        try:
+            self.publish_loop()
+        except KeyboardInterrupt:
+            log.info("shutting down")
+            self.driver.release_all()
+
+
+if __name__ == "__main__":
+    Agent().run()
+errupt:
             log.info("shutting down")
             self.driver.release_all()
 
