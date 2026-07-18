@@ -12,7 +12,7 @@ From the OT world down to the metal:
    endpoint that models every robot. Also the k3s server.
 4. **Raspberry Pi robots.** Each drives its servos, runs a local safe-stop, and
    reports to the gateway. k3s agents.
-5. **Arm hardware.** SG90 servos driven from GPIO via pigpio.
+5. **Arm hardware.** SG90 servos driven from GPIO via lgpio.
 
 ## Why the arm is an OPC UA field device
 

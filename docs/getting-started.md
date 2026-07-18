@@ -12,7 +12,7 @@ UA is the secure backbone, and k3s orchestrates the containers.
 | Reference architecture | Your mini rig | Role |
 |---|---|---|
 | Field devices (PLCs, I/O, instrumentation) | Robotic arm + pubsub_agent on the Pi | Source of process data, receiver of commands via MQTT; publishes fleet/<id>/state, subscribes to fleet/<id>/cmd |
-| Thin edge client on the robot | Raspberry Pi (k3s agent) | Real-time control loop, safe-stop watchdog, MQTT pubsub client; uses pigpio (mock fallback) |
+| Thin edge client on the robot | Raspberry Pi (k3s agent) | Real-time control loop, safe-stop watchdog, MQTT pubsub client; uses lgpio (mock fallback) |
 | Edge AI node | DGX Spark (k3s server) | Inference, MQTT broker, OPC UA fleet gateway, ROS 2 bridge, optional AI-results OPC UA server |
 | Secure comms via OPC UA | OPC UA over your LAN, port 4840 (to gateway); MQTT over port 1883 (to broker) | OT apps browse one fleet endpoint; robot link uses OPC UA PubSub JSON over MQTT |
 | OT platform / MES / cloud apps | Your laptop dashboard or an OPC UA browser | Consumer of AI results and arm state via the gateway |
@@ -91,7 +91,7 @@ Arm1/<joint>/state (read-only) per robot.
    `dmesg`.
 2. Run `pi-agent/pubsub_agent.py` (see the codebase for environment variables:
    ROBOT_ID, ARM_JOINTS, ARM_CHANNELS, WATCHDOG_S, STATE_HZ, ANGLE_MIN/MAX). It
-   drives the servos via `servo_driver.py` (pigpio, with mock fallback), runs a
+   drives the servos via `servo_driver.py` (lgpio, with mock fallback), runs a
    local safe-stop watchdog, PUBLISHES joint state to `fleet/<robot_id>/state`
    and SUBSCRIBES to commands on `fleet/<robot_id>/cmd` over MQTT. Messages use
    standard OPC UA PubSub JSON NetworkMessages (Part 14, JSON mapping) via the

@@ -50,8 +50,7 @@ WATCHDOG_S = float(os.getenv("WATCHDOG_S", "2.0"))
 STATE_HZ = float(os.getenv("STATE_HZ", "5"))
 # BCM GPIO pins, one per joint. Default is a conflict-free set on the Pi 4
 # 40-pin header (BCM 17,27,22,23 = physical pins 11,13,15,16); these avoid the
-# I2C/SPI/UART/I2S buses. pigpio drives DMA-timed PWM on any GPIO, so hardware
-# PWM pins are not required.
+# I2C/SPI/UART/I2S buses. lgpio drives software PWM on any GPIO via /dev/gpiochip.
 CHANNELS = [int(c) for c in os.getenv("ARM_CHANNELS", "17,27,22,23").split(",")]
 JOINTS = os.getenv("ARM_JOINTS", "base,pitch,reach,gripper").split(",")
 
