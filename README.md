@@ -85,79 +85,194 @@ robots: add more `ROBOT_ID` instances and set `ROBOTS` on the gateway.
 
 ## Running the full stack (k3s)
 
-Deploy the centralized OPC UA fleet to real hardware using the k3s manifest.
+This walkthrough takes you from bare hardware to a live OPC UA fleet endpoint.
+Everything is deployed by a single manifest, `deploy/k3s/k3s-opcua-stack.yaml`,
+which creates the `edge-opcua` namespace, an MQTT broker, the OPC UA gateway,
+and one agent per robot. Do the steps in order; each one builds on the last.
 
-### Prerequisites
+### Step 0 — What you need
 
-- One DGX Spark (control plane) and one or more Raspberry Pis (agents).
-- Install k3s:
+- **One DGX Spark** — becomes the k3s server (control plane), and also runs the
+  MQTT broker and the OPC UA fleet gateway.
+- **One or more Raspberry Pis** — each becomes a k3s agent wired to one arm.
+- A workstation with an OPC UA client (e.g. [UaExpert](https://www.unified-automation.com/products/development-tools/uaexpert.html))
+  to browse the fleet once it is up.
+- The arms wired to their Pis (see [On hardware](#on-hardware)). You can also
+  bring the stack up first in mock mode and wire the arms later.
 
-  ```sh
-  # On Spark (server):
-  curl -sfL https://get.k3s.io | sh -
+### Step 1 — Install k3s and join the Pis
 
-  # On each Pi (agent, replace <spark-ip>):
-  curl -sfL https://get.k3s.io | K3S_URL=https://<spark-ip>:6443 K3S_TOKEN=<token> sh -
-  ```
-
-- Label the nodes so workloads land on the correct hardware:
-
-  ```sh
-  kubectl label node <pi-hostname>    role=arm
-  kubectl label node <spark-hostname> role=edge
-  ```
-
-  See `deploy/k3s/k3s-opcua-stack.yaml` header for more details.
-
-### Build and push container images
-
-- Build the gateway image on the Spark:
-
-  ```sh
-  cd spark-gateway && docker build -t your-registry/spark-gateway:latest .
-  docker push your-registry/spark-gateway:latest
-  ```
-
-- Build the Pi agent image on a Pi (or cross-build for arm64):
-
-  ```sh
-  cd pi-agent && docker build -t your-registry/pi-agent:latest .
-  docker push your-registry/pi-agent:latest
-  ```
-
-- Update `deploy/k3s/k3s-opcua-stack.yaml` if your registry or image tags differ.
-
-### Configure the fleet
-
-- Edit the `opcua-config` ConfigMap in `deploy/k3s/k3s-opcua-stack.yaml`:
-
-  - `ROBOTS`: comma-separated robot IDs (`arm1` for one, `arm1,arm2,arm3` for many).
-  - Keep `MQTT_HOST=mqtt-broker`, `MQTT_PORT=1883`, `OPCUA_PORT=4840`.
-
-- For each additional robot, deploy a separate `pi-agent` Deployment with a
-  distinct `ROBOT_ID` (the manifest header explains the pattern).
-
-### Apply the stack
+On the **Spark** (installs the k3s server):
 
 ```sh
-kubectl apply -f deploy/k3s/k3s-opcua-stack.yaml
+curl -sfL https://get.k3s.io | sh -
 ```
 
-### Verify
+Grab the node token the agents need to join:
 
 ```sh
-kubectl -n edge-opcua get pods
+sudo cat /var/lib/rancher/k3s/server/node-token
 ```
 
-Confirm `mqtt-broker`, `spark-gateway`, and `pi-agent` (plus optional `ros2-opcua-bridge`, `opcua-ai-results-server`) are Running.
+On **each Pi** (joins as an agent — replace `<spark-ip>` and `<token>`):
 
-- Use UaExpert (or any OPC UA client) to connect to the fleet endpoint:
-  `opc.tcp://<spark-host>:4840/fleet/`
-- You should see one node per robot (Arm1, Arm2, … ArmN), each with per-joint
-  target and state nodes.
+```sh
+curl -sfL https://get.k3s.io | K3S_URL=https://<spark-ip>:6443 K3S_TOKEN=<token> sh -
+```
 
-This single flow works for one robot or many; only the `ROBOTS` list and number
-of `pi-agent` Deployments change—the topology stays centralized.
+Back on the Spark, confirm every node has joined (`kubectl` on k3s needs sudo,
+or copy `/etc/rancher/k3s/k3s.yaml` to `~/.kube/config`):
+
+```sh
+sudo kubectl get nodes -o wide
+```
+
+### Step 2 — Label the nodes
+
+Workloads are pinned by node label: the gateway and broker land on the Spark
+(`role=edge`), and each agent lands on a Pi (`role=arm`). Use the hostnames from
+`kubectl get nodes`:
+
+```sh
+sudo kubectl label node <spark-hostname> role=edge
+sudo kubectl label node <pi-hostname>    role=arm
+```
+
+Without these labels the pods stay `Pending` (see [Troubleshooting](#troubleshooting-k3s)).
+
+### Step 3 — Provide the container images
+
+k3s runs images from its own containerd. The manifest sets
+`imagePullPolicy: IfNotPresent`, so either push to a registry both boxes can
+reach, or import locally-built images straight into containerd.
+
+**Option A — local import (simplest for a bench).** Build each image on the box
+that will run it, then import it into k3s:
+
+```sh
+# On the Spark:
+cd spark-gateway && docker build -t spark-gateway:latest .
+docker save spark-gateway:latest | sudo k3s ctr images import -
+
+# On each Pi (native arm64 build):
+cd pi-agent && docker build -t pi-agent:latest .
+docker save pi-agent:latest | sudo k3s ctr images import -
+```
+
+Then set the image names in the manifest to the plain tags (`spark-gateway:latest`,
+`pi-agent:latest`).
+
+**Option B — registry.** Build, tag, and push to a registry, then leave the
+`your-registry/...` image names in the manifest (or point them at your registry):
+
+```sh
+cd spark-gateway && docker build -t your-registry/spark-gateway:latest . && docker push your-registry/spark-gateway:latest
+cd pi-agent      && docker build -t your-registry/pi-agent:latest .      && docker push your-registry/pi-agent:latest
+```
+
+The optional `ros2-opcua-bridge` and `opcua-ai-results-server` images are only
+needed if you keep those Deployments (Step 5).
+
+### Step 4 — Configure the fleet
+
+Edit the `opcua-config` ConfigMap in `deploy/k3s/k3s-opcua-stack.yaml`. These
+values are injected into both the gateway and the agents:
+
+| Key | Meaning | Default |
+|---|---|---|
+| `ROBOTS` | Robot IDs the **gateway** models, comma-separated | `arm1` |
+| `ARM_JOINTS` | Joint names per arm (order matters) | `base,pitch,reach,gripper` |
+| `MQTT_HOST` / `MQTT_PORT` | Broker the gateway and agents connect to | `mqtt-broker` / `1883` |
+| `OPCUA_PORT` | Port for the single OPC UA fleet endpoint | `4840` |
+| `SAMPLE_INTERVAL_MS` | State sampling interval | `100` |
+| `ROS_DOMAIN_ID` | Only used by the optional ROS 2 bridge | `42` |
+
+Two rules keep the gateway and agents in sync:
+
+- The gateway's `ROBOTS` list must contain every robot ID you deploy.
+- Each `pi-agent` Deployment sets its own `ROBOT_ID` (in the Deployment `env`,
+  not the ConfigMap) and must match one entry in `ROBOTS`.
+
+The shipped manifest is preconfigured for a **single robot** (`ROBOTS: "arm1"`
+and one `pi-agent` with `ROBOT_ID=arm1`). To run more than one arm, see
+[Step 7](#step-7--scale-to-more-robots).
+
+Also check the `pi-agent` Deployment's serial device: it mounts `/dev/ttyUSB0`
+via `hostPath`. If your arm enumerates elsewhere (`ls /dev/ttyUSB*` on the Pi),
+update both the `volumeMounts` path and the `hostPath.path`.
+
+### Step 5 — Deploy the stack
+
+```sh
+sudo kubectl apply -f deploy/k3s/k3s-opcua-stack.yaml
+```
+
+This creates, in the `edge-opcua` namespace: the `mqtt-broker`, the
+`spark-gateway`, one `pi-agent`, and the two optional edge-AI Deployments
+(`ros2-opcua-bridge`, `opcua-ai-results-server`). If you don't want the optional
+components, delete their blocks from the manifest before applying, or remove
+them afterward with `kubectl delete deployment -n edge-opcua ros2-opcua-bridge opcua-ai-results-server`.
+
+### Step 6 — Verify
+
+Watch the pods come up:
+
+```sh
+sudo kubectl -n edge-opcua get pods -o wide
+```
+
+`mqtt-broker`, `spark-gateway`, and `pi-agent` should reach `Running`. Tail the
+logs to confirm the bridge is flowing:
+
+```sh
+sudo kubectl -n edge-opcua logs deploy/spark-gateway   # "OPC UA fleet endpoint on port 4840, robots=['arm1']"
+sudo kubectl -n edge-opcua logs deploy/pi-agent        # connects to broker, publishes state
+```
+
+Then connect an OPC UA client to the fleet endpoint on the Spark:
+
+```
+opc.tcp://<spark-host>:4840/fleet/
+```
+
+You should see one object per robot (`Arm1`, `Arm2`, … `ArmN`), each exposing a
+`state` node and a `target` node per joint. Write a value to a joint's `target`
+node and watch the matching `state` node follow it — that round trip proves the
+OPC UA → MQTT → agent → MQTT → OPC UA path end to end.
+
+### Step 7 — Scale to more robots
+
+Adding an arm never changes the topology — you extend the `ROBOTS` list and add
+one more agent:
+
+1. Add the ID to the ConfigMap: `ROBOTS: "arm1,arm2"`.
+2. Copy the `pi-agent` Deployment block in the manifest and, in the copy, change
+   the `metadata.name` (e.g. `pi-agent-arm2`), the `ROBOT_ID` env value
+   (`arm2`), and — if it runs on a different Pi — the `nodeSelector`/label so it
+   lands on the right board.
+3. Re-apply: `sudo kubectl apply -f deploy/k3s/k3s-opcua-stack.yaml`.
+
+The gateway picks up the new robot in its model and a new `Arm2` object appears
+under the same OPC UA endpoint.
+
+### Troubleshooting (k3s)
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Pod stuck `Pending` | Node labels missing | Re-run the `kubectl label node ...` commands (Step 2) |
+| `ImagePullBackOff` | Image not on the node / registry unreachable | Import locally (Step 3, Option A) or fix the registry path |
+| `pi-agent` `CrashLoopBackOff` | Wrong serial device path | Correct `/dev/ttyUSB0` in the Deployment, or run mock (remove the device mount) |
+| OPC UA client can't connect | Firewall or wrong host | Ensure the Spark's `4840/tcp` is reachable; the gateway uses `hostNetwork`, so use the Spark's real IP |
+| `state` never moves | Agent not matched to a `ROBOTS` entry | Make each `ROBOT_ID` match one ID in `ROBOTS` |
+
+### Teardown
+
+```sh
+sudo kubectl delete -f deploy/k3s/k3s-opcua-stack.yaml
+```
+
+This removes the whole `edge-opcua` namespace and everything in it; k3s itself
+stays installed.
 
 ## On hardware
 
@@ -175,11 +290,13 @@ for the design rationale.
 The gateway and agents exchange OPC UA PubSub JSON NetworkMessages conforming to
 OPC UA Part 14 (JSON message mapping) over the MQTT transport—one of the standard
 OPC UA PubSub transports. The encoding is the official OPC UA PubSub JSON format:
-NetworkMessage with MessageType "ua-data" carrying DataSetMessages whose Payload
-fields are DataValue/Variant-encoded (e.g. Double type id 11 is represented as
-`{"Value":{"Type":11,"Body":90.0}}`). asyncua provides the OPC UA client/server
-(north/OT-facing) endpoint; paho-mqtt provides the broker transport; the
-on-the-wire PubSub message format itself—the JSON NetworkMessage—is the
-standardized OPC UA encoding, implemented in the shared `ua_pubsub.py` codec.
-open62541 is an alternative full-stack option, but this repo is fully spec-compliant
-for PubSub over MQTT.
+a NetworkMessage with MessageType `ua-data` carrying DataSetMessages
+(`ua-keyframe`) whose Payload fields use the Part 6 (v1.05) JSON Data Encoding.
+Under VerboseEncoding a concrete scalar collapses to its bare JSON value
+(e.g. a Double joint angle is simply `"base": 90.0`), and the DataSetMessage
+`Status` is omitted when the value is Good. asyncua provides the OPC UA
+client/server (north/OT-facing) endpoint; paho-mqtt provides the broker
+transport; the on-the-wire PubSub message format itself—the JSON
+NetworkMessage—is the standardized OPC UA encoding, implemented in the shared
+`ua_pubsub.py` codec. open62541 is an alternative full-stack option, but this
+repo is fully spec-compliant for PubSub over MQTT.
