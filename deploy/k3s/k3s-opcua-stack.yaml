@@ -1,0 +1,236 @@
+# =============================================================================
+# k3s manifests: OPC UA backbone + ROS 2 edge AI stack
+# Topology:
+#   - DGX Spark  = k3s server (control plane) + AI + OPC UA client + ROS 2 bridge
+#   - Raspberry Pi = k3s agent, physically wired to the robotic arm
+#   - The arm is exposed on the OPC UA backbone by a server running ON the Pi
+#
+# Prereqs (run once, see the guide for full steps):
+#   Spark:  curl -sfL https://get.k3s.io | sh -          (installs k3s server)
+#   Pi:     curl -sfL https://get.k3s.io | K3S_URL=... K3S_TOKEN=... sh -   (agent)
+#   Label the nodes so workloads land on the right box:
+#     kubectl label node <pi-hostname>    role=arm
+#     kubectl label node <spark-hostname> role=edge
+#
+# Apply with:  kubectl apply -f k3s-opcua-stack.yaml
+# =============================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: edge-opcua
+
+---
+# -----------------------------------------------------------------------------
+# Shared config: where the OPC UA endpoint lives, ROS domain, etc.
+# Edit these values to match your setup.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opcua-config
+  namespace: edge-opcua
+data:
+  # The Pi's OPC UA server endpoint. Uses the in-cluster Service name below.
+  OPCUA_ENDPOINT: "opc.tcp://opcua-arm-server.edge-opcua.svc.cluster.local:4840/arm/"
+  OPCUA_SECURITY: "Basic256Sha256"        # start with None while prototyping
+  ROS_DOMAIN_ID: "42"
+  SAMPLE_INTERVAL_MS: "100"
+
+---
+# =============================================================================
+# LAYER 1 - FIELD DEVICE
+# OPC UA server that represents the robotic arm on the backbone.
+# Runs on the Pi (role=arm) because that is where the arm is physically wired.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opcua-arm-server
+  namespace: edge-opcua
+  labels:
+    app: opcua-arm-server
+    tier: field-device
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: opcua-arm-server
+  template:
+    metadata:
+      labels:
+        app: opcua-arm-server
+        tier: field-device
+    spec:
+      nodeSelector:
+        role: arm                 # pin to the Pi
+      hostNetwork: true           # so OPC UA discovery + port 4840 work cleanly
+      containers:
+        - name: opcua-arm-server
+          image: your-registry/opcua-arm-server:latest   # your asyncua server image
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 4840
+          envFrom:
+            - configMapRef:
+                name: opcua-config
+          securityContext:
+            privileged: true      # needed to reach the USB/serial device
+          volumeMounts:
+            - name: arm-serial
+              mountPath: /dev/ttyUSB0
+      volumes:
+        - name: arm-serial
+          hostPath:
+            path: /dev/ttyUSB0    # change if your arm enumerates elsewhere
+            type: CharDevice
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opcua-arm-server
+  namespace: edge-opcua
+spec:
+  selector:
+    app: opcua-arm-server
+  ports:
+    - name: opcua
+      port: 4840
+      targetPort: 4840
+  # ClusterIP is fine because the client is also in-cluster.
+  # Switch to type: NodePort if you want to browse the server from a laptop.
+
+---
+# =============================================================================
+# LAYER 2 - EDGE AI + OPC UA CLIENT
+# Runs on the Spark (role=edge). Subscribes to the arm's OPC UA server,
+# runs inference on the GPU, and can write commands/setpoints back.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge-ai-client
+  namespace: edge-opcua
+  labels:
+    app: edge-ai-client
+    tier: edge-ai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: edge-ai-client
+  template:
+    metadata:
+      labels:
+        app: edge-ai-client
+        tier: edge-ai
+    spec:
+      nodeSelector:
+        role: edge                # pin to the Spark
+      runtimeClassName: nvidia    # requires the NVIDIA container runtime in k3s
+      containers:
+        - name: edge-ai-client
+          image: your-registry/edge-ai-client:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: opcua-config
+          resources:
+            limits:
+              nvidia.com/gpu: 1   # requires the NVIDIA device plugin
+      # Uncomment if you enable OPC UA security and mount certs from a Secret:
+      #   volumeMounts:
+      #     - name: opcua-certs
+      #       mountPath: /certs
+      # volumes:
+      #   - name: opcua-certs
+      #     secret:
+      #       secretName: opcua-certs
+
+---
+# =============================================================================
+# LAYER 3 - ROS 2 <-> OPC UA BRIDGE
+# Translates ROS 2 topics/services to OPC UA nodes and back.
+# hostNetwork lets ROS 2 DDS discovery work without extra config.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ros2-opcua-bridge
+  namespace: edge-opcua
+  labels:
+    app: ros2-opcua-bridge
+    tier: bridge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ros2-opcua-bridge
+  template:
+    metadata:
+      labels:
+        app: ros2-opcua-bridge
+        tier: bridge
+    spec:
+      nodeSelector:
+        role: edge                # co-locate with the AI node on the Spark
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet   # keep cluster DNS while on host net
+      containers:
+        - name: ros2-opcua-bridge
+          image: your-registry/ros2-opcua-bridge:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: opcua-config
+
+---
+# =============================================================================
+# OPTIONAL - AI results exposed BACK onto the backbone as an OPC UA server,
+# so MES / dashboards / OT apps can subscribe through the same standard.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opcua-ai-results-server
+  namespace: edge-opcua
+  labels:
+    app: opcua-ai-results-server
+    tier: edge-ai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: opcua-ai-results-server
+  template:
+    metadata:
+      labels:
+        app: opcua-ai-results-server
+        tier: edge-ai
+    spec:
+      nodeSelector:
+        role: edge
+      hostNetwork: true
+      containers:
+        - name: opcua-ai-results-server
+          image: your-registry/opcua-ai-results-server:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 4841
+          env:
+            - name: OPCUA_BIND_PORT
+              value: "4841"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opcua-ai-results-server
+  namespace: edge-opcua
+spec:
+  selector:
+    app: opcua-ai-results-server
+  ports:
+    - name: opcua
+      port: 4841
+      targetPort: 4841
