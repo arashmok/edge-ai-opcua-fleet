@@ -1,9 +1,10 @@
 # =============================================================================
-# k3s manifests: OPC UA backbone + ROS 2 edge AI stack
-# Topology:
-#   - DGX Spark  = k3s server (control plane) + AI + OPC UA client + ROS 2 bridge
+# k3s manifests: OPC UA fleet gateway + MQTT pubsub agent stack
+# Topology (ALWAYS CENTRALIZED):
+#   - DGX Spark  = k3s server (control plane) + MQTT broker + OPC UA fleet gateway
 #   - Raspberry Pi = k3s agent, physically wired to the robotic arm
-#   - The arm is exposed on the OPC UA backbone by a server running ON the Pi
+#   - The Pi runs a pubsub_agent.py MQTT client that publishes state and receives commands
+#   - A single OPC UA endpoint on the Spark models the whole fleet at opc.tcp://<spark>:4840/fleet/
 #
 # Prereqs (run once, see the guide for full steps):
 #   Spark:  curl -sfL https://get.k3s.io | sh -          (installs k3s server)
@@ -13,6 +14,8 @@
 #     kubectl label node <spark-hostname> role=edge
 #
 # Apply with:  kubectl apply -f k3s-opcua-stack.yaml
+# To scale to additional robots: add robot ids to ROBOTS below (e.g. arm1,arm2,arm3)
+# and deploy another pi-agent Deployment with a distinct ROBOT_ID (topology unchanged).
 # =============================================================================
 
 apiVersion: v1
@@ -22,7 +25,7 @@ metadata:
 
 ---
 # -----------------------------------------------------------------------------
-# Shared config: where the OPC UA endpoint lives, ROS domain, etc.
+# Shared config: MQTT broker, OPC UA fleet port, robot list, and timing.
 # Edit these values to match your setup.
 # -----------------------------------------------------------------------------
 apiVersion: v1
@@ -31,49 +34,174 @@ metadata:
   name: opcua-config
   namespace: edge-opcua
 data:
-  # The Pi's OPC UA server endpoint. Uses the in-cluster Service name below.
-  OPCUA_ENDPOINT: "opc.tcp://opcua-arm-server.edge-opcua.svc.cluster.local:4840/arm/"
-  OPCUA_SECURITY: "Basic256Sha256"        # start with None while prototyping
+  # MQTT broker connection
+  MQTT_HOST: "mqtt-broker"
+  MQTT_PORT: "1883"
+  # OPC UA fleet endpoint on the Spark
+  OPCUA_PORT: "4840"
+  # ROBOTS: comma-separated list of robot IDs (add more to scale, topology unchanged)
+  ROBOTS: "arm1"
+  # Joint names used by gateway and agents
+  ARM_JOINTS: "base,pitch,reach,gripper"
+  # ROS domain ID for bridge components
   ROS_DOMAIN_ID: "42"
+  # Sampling interval in milliseconds
   SAMPLE_INTERVAL_MS: "100"
 
 ---
 # =============================================================================
-# LAYER 1 - FIELD DEVICE
-# OPC UA server that represents the robotic arm on the backbone.
-# Runs on the Pi (role=arm) because that is where the arm is physically wired.
-# =============================================================================
+# MQTT BROKER - runs on the Spark (role=edge)
+# Provides the pubsub transport for OPC UA Fleet connectivity.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mqtt-config
+  namespace: edge-opcua
+data:
+  mosquitto.conf: |
+    listener 1883
+    allow_anonymous true
+
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: opcua-arm-server
+  name: mqtt-broker
   namespace: edge-opcua
   labels:
-    app: opcua-arm-server
-    tier: field-device
+    app: mqtt-broker
+    tier: broker
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: opcua-arm-server
+      app: mqtt-broker
   template:
     metadata:
       labels:
-        app: opcua-arm-server
-        tier: field-device
+        app: mqtt-broker
+        tier: broker
     spec:
       nodeSelector:
-        role: arm                 # pin to the Pi
-      hostNetwork: true           # so OPC UA discovery + port 4840 work cleanly
+        role: edge                # pin to the Spark
       containers:
-        - name: opcua-arm-server
-          image: your-registry/opcua-arm-server:latest   # your asyncua server image
+        - name: mqtt-broker
+          image: eclipse-mosquitto:2
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 1883
+          volumeMounts:
+            - name: config-volume
+              mountPath: /mosquitto/config/mosquitto.conf
+              subPath: mosquitto.conf
+      volumes:
+        - name: config-volume
+          configMap:
+            name: mqtt-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mqtt-broker
+  namespace: edge-opcua
+spec:
+  selector:
+    app: mqtt-broker
+  ports:
+    - name: mqtt
+      port: 1883
+      targetPort: 1883
+
+---
+# =============================================================================
+# SPARK GATEWAY - OPC UA fleet endpoint on the Spark (role=edge)
+# Hosts ONE OPC UA server representing the whole fleet at opc.tcp://<spark>:4840/fleet/
+# -----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spark-gateway
+  namespace: edge-opcua
+  labels:
+    app: spark-gateway
+    tier: gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spark-gateway
+  template:
+    metadata:
+      labels:
+        app: spark-gateway
+        tier: gateway
+    spec:
+      nodeSelector:
+        role: edge                # pin to the Spark
+      hostNetwork: true           # so OPC UA discovery and the OPC UA port work cleanly
+      containers:
+        - name: spark-gateway
+          image: your-registry/spark-gateway:latest
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 4840
           envFrom:
             - configMapRef:
                 name: opcua-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-gateway
+  namespace: edge-opcua
+spec:
+  selector:
+    app: spark-gateway
+  ports:
+    - name: opcua
+      port: 4840
+      targetPort: 4840
+
+---
+# =============================================================================
+# PI AGENT (pubsub_agent) - MQTT client on the Pi (role=arm)
+# Publishes joint state to fleet/<robot_id>/state, subscribes to fleet/<robot_id>/cmd
+# -----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pi-agent
+  namespace: edge-opcua
+  labels:
+    app: pi-agent
+    tier: agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pi-agent
+  template:
+    metadata:
+      labels:
+        app: pi-agent
+        tier: agent
+    spec:
+      nodeSelector:
+        role: arm                 # pin to the Pi
+      hostNetwork: true           # allows consistent serial device access
+      containers:
+        - name: pi-agent
+          image: your-registry/pi-agent:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: opcua-config
+          env:
+            - name: ROBOT_ID
+              value: "arm1"
           securityContext:
             privileged: true      # needed to reach the USB/serial device
           volumeMounts:
@@ -86,73 +214,10 @@ spec:
             type: CharDevice
 
 ---
-apiVersion: v1
-kind: Service
-metadata:
-  name: opcua-arm-server
-  namespace: edge-opcua
-spec:
-  selector:
-    app: opcua-arm-server
-  ports:
-    - name: opcua
-      port: 4840
-      targetPort: 4840
-  # ClusterIP is fine because the client is also in-cluster.
-  # Switch to type: NodePort if you want to browse the server from a laptop.
-
----
 # =============================================================================
-# LAYER 2 - EDGE AI + OPC UA CLIENT
-# Runs on the Spark (role=edge). Subscribes to the arm's OPC UA server,
-# runs inference on the GPU, and can write commands/setpoints back.
-# =============================================================================
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: edge-ai-client
-  namespace: edge-opcua
-  labels:
-    app: edge-ai-client
-    tier: edge-ai
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: edge-ai-client
-  template:
-    metadata:
-      labels:
-        app: edge-ai-client
-        tier: edge-ai
-    spec:
-      nodeSelector:
-        role: edge                # pin to the Spark
-      runtimeClassName: nvidia    # requires the NVIDIA container runtime in k3s
-      containers:
-        - name: edge-ai-client
-          image: your-registry/edge-ai-client:latest
-          imagePullPolicy: IfNotPresent
-          envFrom:
-            - configMapRef:
-                name: opcua-config
-          resources:
-            limits:
-              nvidia.com/gpu: 1   # requires the NVIDIA device plugin
-      # Uncomment if you enable OPC UA security and mount certs from a Secret:
-      #   volumeMounts:
-      #     - name: opcua-certs
-      #       mountPath: /certs
-      # volumes:
-      #   - name: opcua-certs
-      #     secret:
-      #       secretName: opcua-certs
-
----
-# =============================================================================
-# LAYER 3 - ROS 2 <-> OPC UA BRIDGE
+# Optional ROS 2 <-> OPC UA Bridge
 # Translates ROS 2 topics/services to OPC UA nodes and back.
-# hostNetwork lets ROS 2 DDS discovery work without extra config.
+# Adjust OPCUA_ENDPOINT to point at the spark-gateway fleet endpoint.
 # =============================================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -174,21 +239,28 @@ spec:
         tier: bridge
     spec:
       nodeSelector:
-        role: edge                # co-locate with the AI node on the Spark
+        role: edge                # co-locate with the gateway on the Spark
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet   # keep cluster DNS while on host net
       containers:
         - name: ros2-opcua-bridge
           image: your-registry/ros2-opcua-bridge:latest
           imagePullPolicy: IfNotPresent
-          envFrom:
-            - configMapRef:
-                name: opcua-config
+          env:
+            - name: OPCUA_ENDPOINT
+              value: "opc.tcp://spark-gateway.edge-opcua.svc.cluster.local:4840/fleet/"
+            - name: OPCUA_SECURITY
+              value: "None"
+            - name: ROS_DOMAIN_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: opcua-config
+                  key: ROS_DOMAIN_ID
 
 ---
 # =============================================================================
-# OPTIONAL - AI results exposed BACK onto the backbone as an OPC UA server,
-# so MES / dashboards / OT apps can subscribe through the same standard.
+# Optional AI results server (exposes ROS inference results via OPC UA)
+# Adjust OPCUA_ENDPOINT to point at the spark-gateway fleet endpoint.
 # =============================================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -221,6 +293,9 @@ spec:
           env:
             - name: OPCUA_BIND_PORT
               value: "4841"
+            - name: OPCUA_ENDPOINT
+              value: "opc.tcp://spark-gateway.edge-opcua.svc.cluster.local:4840/fleet/"
+
 ---
 apiVersion: v1
 kind: Service

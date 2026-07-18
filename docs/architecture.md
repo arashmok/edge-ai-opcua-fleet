@@ -8,8 +8,8 @@ From the OT world down to the metal:
    UaExpert). They consume data and issue commands through OPC UA.
 2. **OPC UA backbone.** A vendor-neutral, secure (certificate-based, encrypted)
    industrial data bus. This is the interface OT systems speak.
-3. **DGX Spark edge node.** Runs the AI inference and, in the fleet design, hosts
-   the single OPC UA endpoint that models every robot. Also the k3s server.
+3. **DGX Spark edge node.** Runs the AI inference and hosts the single OPC UA
+   endpoint that models every robot. Also the k3s server.
 4. **Raspberry Pi robots.** Each drives its servos, runs a local safe-stop, and
    reports to the gateway. k3s agents.
 5. **Arm hardware.** SG90 servos driven from GPIO via pigpio.
@@ -22,16 +22,17 @@ is exposed as joint objects, each with a writable `target` and a read-only
 servos, GPIO, or Python. That abstraction is the whole value of putting OPC UA
 in the loop.
 
-## Single robot vs centralized fleet
+## Centralized architecture
 
-**Single robot.** Each Pi hosts its own OPC UA server. Simple, but every robot
-exposes a socket, every OT client holds a session per robot, and certificates
-multiply per device. Fine for one or two arms.
+The DGX Spark hosts one OPC UA endpoint that models the entire fleet (Arm1..ArmN).
+OT apps browse everyone in a single session, and adding a robot is just a new id
+in the ROBOTS list; no topology change is required. Whether you run one robot or
+many, the setup is identical: the Spark hosts the OPC UA endpoint, and each robot
+is a lightweight MQTT client that publishes state and subscribes to commands.
+No robot hosts an inbound socket.
 
-**Centralized fleet.** The Spark hosts one OPC UA endpoint that models the whole
-fleet (Arm1..ArmN). OT apps browse everyone in a single session, and adding a
-robot is just a new id. The robots become lightweight clients that publish state
-and subscribe to commands over MQTT. No robot hosts an inbound socket.
+A single robot is simply the centralized setup with `ROBOTS=arm1`. The same flow
+and components are used; only the robot list changes.
 
 ## Why MQTT is still OPC UA
 
