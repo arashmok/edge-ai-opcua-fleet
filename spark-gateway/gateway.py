@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """
 Central gateway on the DGX Spark. Hosts ONE OPC UA server that models the whole
-fleet, and bridges it to the robots over MQTT (the OPC UA PubSub transport).
+fleet, and bridges it to the robots over MQTT using OPC UA PubSub JSON
+NetworkMessages (OPC UA Part 14) via the ua_pubsub codec.
 
-North side (OT facing):
-  A single OPC UA endpoint opc.tcp://<spark>:4840 with an address space:
-    Arm1/<joint>/target  (writable)   Arm1/<joint>/state  (read only)
-    Arm2/...                          ArmN/...
-  OT apps, MES, and dashboards browse every robot in one session.
+This file supersedes the earlier gateway.py and gateway_new.py; delete those.
+
+North side (OT facing), a single OPC UA endpoint opc.tcp://<spark>:4840/fleet/:
+    <robot>/<joint>/target   writable    commanded angle
+    <robot>/<joint>/state    read only   reported angle
+    <robot>/safe_stop        writable    release this robot
+    Fleet/safe_stop          writable    release the whole fleet
+  OT apps browse every robot in one session.
 
 South side (robot facing) over MQTT:
-  subscribes  fleet/+/state   and copies values into the OPC UA state nodes
-  publishes   fleet/<id>/cmd  whenever a target node is written
+  subscribes  fleet/+/state   decodes DSW_STATE NetworkMessages into state nodes
+  publishes   fleet/<id>/cmd  streams DSW_COMMAND setpoints at CMD_HZ
 
-Note on standards: this starter implements the PubSub PATTERN pragmatically,
-using an asyncua OPC UA server for the north side and paho MQTT for the broker
-transport. A fully spec-compliant OPC UA PubSub deployment would use a
-PubSub-capable stack (for example open62541) end to end. The topology and the
-address space are identical either way.
+Why stream setpoints instead of sending only on change: the robot's safety
+watchdog releases the servos if no command arrives within its timeout. Edge
+triggered commands would make a stationary arm droop. Streaming the full
+setpoint set at a steady rate keeps the arm held and doubles as a heartbeat, so
+the watchdog trips only on a real loss of the gateway or broker.
 
 Env (all optional):
   OPCUA_PORT   default 4840
@@ -25,15 +29,17 @@ Env (all optional):
   MQTT_PORT    default 1883
   ROBOTS       comma list of robot ids,  default "arm1,arm2,arm3"
   ARM_JOINTS   joint names,              default "base,pitch,reach,gripper"
+  CMD_HZ       setpoint stream rate,     default 10
 """
 
 import asyncio
-import json
 import logging
 import os
 
 import paho.mqtt.client as mqtt
 from asyncua import Server
+
+from ua_pubsub import encode, decode, DSW_STATE, DSW_COMMAND
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("gateway")
@@ -43,15 +49,19 @@ MQTT_HOST = os.getenv("MQTT_HOST", "mqtt-broker")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 ROBOTS = os.getenv("ROBOTS", "arm1,arm2,arm3").split(",")
 JOINTS = os.getenv("ARM_JOINTS", "base,pitch,reach,gripper").split(",")
+CMD_HZ = float(os.getenv("CMD_HZ", "10"))
 
 
 class Gateway:
     def __init__(self, loop):
         self.loop = loop
-        self.target_nodes = {}   # (robot, joint) -> writable OPC UA node
-        self.state_nodes = {}    # (robot, joint) -> read-only OPC UA node
-        self.last_target = {}    # (robot, joint) -> last published value
-        self.client = mqtt.Client(client_id="fleet-gateway")
+        self.target_nodes = {}       # (robot, joint) -> writable node
+        self.state_nodes = {}        # (robot, joint) -> read-only node
+        self.robot_stop_nodes = {}   # robot -> writable safe_stop node
+        self.fleet_stop_node = None  # fleet-wide writable safe_stop node
+        self.cmd_seq = {robot: 0 for robot in ROBOTS}
+        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
+                                  client_id="fleet-gateway")
         self.client.on_connect = self._on_connect
         self.client.on_message = self._on_message
 
@@ -62,8 +72,16 @@ class Gateway:
         self.server.set_endpoint(f"opc.tcp://0.0.0.0:{PORT}/fleet/")
         self.server.set_server_name("OPC UA Fleet Gateway")
         idx = await self.server.register_namespace("http://fleet.local")
+
+        fleet_obj = await self.server.nodes.objects.add_object(idx, "Fleet")
+        self.fleet_stop_node = await fleet_obj.add_variable(idx, "safe_stop", False)
+        await self.fleet_stop_node.set_writable()
+
         for robot in ROBOTS:
             robot_obj = await self.server.nodes.objects.add_object(idx, robot)
+            stop_node = await robot_obj.add_variable(idx, "safe_stop", False)
+            await stop_node.set_writable()
+            self.robot_stop_nodes[robot] = stop_node
             for joint in JOINTS:
                 jnode = await robot_obj.add_object(idx, joint)
                 tnode = await jnode.add_variable(idx, "target", 90.0)
@@ -71,22 +89,24 @@ class Gateway:
                 await tnode.set_writable()
                 self.target_nodes[(robot, joint)] = tnode
                 self.state_nodes[(robot, joint)] = snode
-                self.last_target[(robot, joint)] = 90.0
 
     # ---- MQTT (runs in paho's own thread) ----
-    def _on_connect(self, client, userdata, flags, rc):
-        log.info("gateway connected to broker %s:%s rc=%s", MQTT_HOST, MQTT_PORT, rc)
-        client.subscribe("fleet/+/state")
+    def _on_connect(self, client, userdata, flags, reason_code, properties):
+        log.info("gateway connected to broker %s:%s rc=%s", MQTT_HOST, MQTT_PORT, reason_code)
+        client.subscribe("fleet/+/state", qos=0)
 
     def _on_message(self, client, userdata, msg):
         try:
-            payload = json.loads(msg.payload.decode())
-        except ValueError:
+            decoded = decode(msg.payload)
+        except ValueError as exc:
+            log.warning("failed to decode on %s: %s", msg.topic, exc)
             return
-        robot = payload.get("robot_id")
-        joints = payload.get("joints", {})
-        # Hand the update to the asyncio loop, which owns the OPC UA nodes.
-        asyncio.run_coroutine_threadsafe(self._apply_state(robot, joints), self.loop)
+        robot = decoded.get("publisher_id")
+        for ds in decoded.get("datasets", []):
+            if ds.get("writer_id") == DSW_STATE:
+                joints = ds.get("fields", {})
+                asyncio.run_coroutine_threadsafe(
+                    self._apply_state(robot, joints), self.loop)
 
     async def _apply_state(self, robot, joints):
         for joint, val in joints.items():
@@ -94,15 +114,25 @@ class Gateway:
             if node is not None:
                 await node.write_value(float(val))
 
-    # ---- North to south: publish target writes down to the robots ----
+    # ---- North to south: stream setpoints + safe_stop to each robot ----
     async def publish_loop(self):
+        period = 1.0 / CMD_HZ
         while True:
-            for (robot, joint), tnode in self.target_nodes.items():
-                val = await tnode.read_value()
-                if abs(val - self.last_target[(robot, joint)]) > 0.5:
-                    self.last_target[(robot, joint)] = val
-                    self.client.publish(f"fleet/{robot}/cmd", json.dumps({joint: val}))
-            await asyncio.sleep(0.05)
+            fleet_stop = await self.fleet_stop_node.read_value()
+            for robot in ROBOTS:
+                robot_stop = await self.robot_stop_nodes[robot].read_value()
+                fields = {"safe_stop": bool(fleet_stop or robot_stop)}
+                for joint in JOINTS:
+                    fields[joint] = float(await self.target_nodes[(robot, joint)].read_value())
+                self.cmd_seq[robot] += 1
+                payload = encode(publisher_id="fleet-gateway",
+                                 dataset_writer_id=DSW_COMMAND,
+                                 sequence_number=self.cmd_seq[robot],
+                                 payload_fields=fields)
+                # QoS 1 so a setpoint is not silently dropped. Never retained:
+                # a retained command would replay a stale setpoint on reconnect.
+                self.client.publish(f"fleet/{robot}/cmd", payload, qos=1, retain=False)
+            await asyncio.sleep(period)
 
     async def run(self):
         await self.build()
