@@ -12,13 +12,15 @@ def test_build_structure():
     assert d["DataSetWriterId"] == 1
     assert d["SequenceNumber"] == 42
     assert d["MetaDataVersion"] == {"MajorVersion": 1, "MinorVersion": 0}
-    assert d["Status"] == 0
+    # Status is omitted from the DataSetMessage when Good (Part 14 7.2.5.4.2).
+    assert "Status" not in d
     assert isinstance(d["Timestamp"], str) and d["Timestamp"]
-    assert d["Payload"]["base"] == {"Value": {"Type": 11, "Body": 90.0}}
+    # Concrete scalar Double collapses to the bare value (Part 14 Table 186).
+    assert d["Payload"]["base"] == 90.0
 
 def test_bool_type():
     m = u.build_network_message("arm1", u.DSW_STATE, 1, {"safe_stop": True})
-    assert m["Messages"][0]["Payload"]["safe_stop"] == {"Value": {"Type": 1, "Body": True}}
+    assert m["Messages"][0]["Payload"]["safe_stop"] is True
 
 def test_encode_json():
     assert json.loads(u.encode("arm1", u.DSW_STATE, 7, {"base": 90.0}))["MessageType"] == "ua-data"

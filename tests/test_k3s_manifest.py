@@ -13,7 +13,7 @@ import sys
 
 import pytest
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardoc))
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 MANIFEST = os.path.join(REPO_ROOT, "deploy", "k3s", "k3s-opcua-stack.yaml")
 DOCKERFILE = os.path.join(REPO_ROOT, "pi-agent", "Dockerfile")
 
