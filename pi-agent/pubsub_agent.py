@@ -20,7 +20,7 @@ Env (all optional):
   ROBOT_ID       default "arm1"
   MQTT_HOST      default "mqtt-broker"
   MQTT_PORT      default 1883
-  ARM_CHANNELS   GPIO BCM pins,  default "13,12,18,19"
+  ARM_CHANNELS   GPIO BCM pins,  default "17,27,22,23" (Pi 4 header pins 11,13,15,16)
   ARM_JOINTS     joint names,    default "base,pitch,reach,gripper"
   ANGLE_MIN / ANGLE_MAX   default 0 / 180
   WATCHDOG_S     stale-command timeout, default 2.0
@@ -48,7 +48,11 @@ ANGLE_MIN = float(os.getenv("ANGLE_MIN", "0"))
 ANGLE_MAX = float(os.getenv("ANGLE_MAX", "180"))
 WATCHDOG_S = float(os.getenv("WATCHDOG_S", "2.0"))
 STATE_HZ = float(os.getenv("STATE_HZ", "5"))
-CHANNELS = [int(c) for c in os.getenv("ARM_CHANNELS", "13,12,18,19").split(",")]
+# BCM GPIO pins, one per joint. Default is a conflict-free set on the Pi 4
+# 40-pin header (BCM 17,27,22,23 = physical pins 11,13,15,16); these avoid the
+# I2C/SPI/UART/I2S buses. pigpio drives DMA-timed PWM on any GPIO, so hardware
+# PWM pins are not required.
+CHANNELS = [int(c) for c in os.getenv("ARM_CHANNELS", "17,27,22,23").split(",")]
 JOINTS = os.getenv("ARM_JOINTS", "base,pitch,reach,gripper").split(",")
 
 CMD_TOPIC = f"fleet/{ROBOT_ID}/cmd"

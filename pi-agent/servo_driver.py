@@ -22,7 +22,8 @@ US_MIN, US_MAX = 500, 2500
 
 class ServoDriver:
     def __init__(self, channels, angle_min=0.0, angle_max=180.0):
-        # "channels" are BCM GPIO pin numbers, for example [13, 12, 18, 19].
+        # "channels" are BCM GPIO pin numbers, for example [17, 27, 22, 23]
+        # (Pi 4 physical header pins 11, 13, 15, 16).
         self.channels = channels
         self.angle_min = angle_min
         self.angle_max = angle_max

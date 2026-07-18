@@ -276,7 +276,10 @@ stays installed.
 
 ## On hardware
 
-- Servo signal wires go to Pi GPIO pins (BCM numbering, default 13,12,18,19).
+- Servo signal wires go to Pi GPIO pins. The default is BCM `17,27,22,23`
+  (Raspberry Pi 4 physical header pins 11, 13, 15, 16) — a conflict-free set
+  clear of the I2C/SPI/UART/I2S buses. Override with `ARM_CHANNELS` if needed.
+  pigpio drives DMA-timed PWM on any GPIO, so hardware-PWM pins are not required.
 - Servos get a SEPARATE 5V supply, never the Pi 5V pin. Tie all grounds together.
 - Enable pigpio on each Pi: `sudo systemctl enable --now pigpiod`.
 - Note: SG90 servos are open loop, so reported state is the commanded angle, not

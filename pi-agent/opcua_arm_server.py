@@ -12,7 +12,7 @@ Exposes per joint:
 
 Env (all optional):
   OPCUA_BIND_PORT   default 4840
-  ARM_CHANNELS      GPIO BCM pins,          default "13,12,18,19"
+  ARM_CHANNELS      GPIO BCM pins,          default "17,27,22,23" (Pi 4 pins 11,13,15,16)
   ARM_JOINTS        joint names,            default "base,pitch,reach,gripper"
   ANGLE_MIN         default 0
   ANGLE_MAX         default 180
@@ -35,7 +35,9 @@ ANGLE_MIN = float(os.getenv("ANGLE_MIN", "0"))
 ANGLE_MAX = float(os.getenv("ANGLE_MAX", "180"))
 WATCHDOG_S = float(os.getenv("WATCHDOG_S", "2.0"))
 PORT = int(os.getenv("OPCUA_BIND_PORT", "4840"))
-CHANNELS = [int(c) for c in os.getenv("ARM_CHANNELS", "13,12,18,19").split(",")]
+# BCM GPIO pins, one per joint. Default BCM 17,27,22,23 = Pi 4 physical header
+# pins 11,13,15,16; a conflict-free set clear of the I2C/SPI/UART/I2S buses.
+CHANNELS = [int(c) for c in os.getenv("ARM_CHANNELS", "17,27,22,23").split(",")]
 JOINTS = os.getenv("ARM_JOINTS", "base,pitch,reach,gripper").split(",")
 
 
