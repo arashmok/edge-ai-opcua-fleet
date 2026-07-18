@@ -16,6 +16,39 @@ robot is just a new id in the ROBOTS list; no topology change is required.
 Whether you have one robot or many, the setup is identical: run the gateway on
 the Spark and one pubsub_agent per robot on its Pi.
 
+```text
++------------------+               +------------------------------------+
+|   OT / Cloud     |               |       DGX Spark (role=edge)        |
+| (MES, Dashboards |    OPC UA     |                                    |
+|  UaExpert, etc.) +-------------->+  +------------------------------+  |
+|                  |   (client)    |  | spark-gateway (gateway.py)   |  |
++------------------+               |  | - Single OPC UA endpoint     |  |
+                                   |  |   opc.tcp://<spark>:4840/    |  |
+                                   |  | - OPC UA<->MQTT bridge        |  |
+                                   |  +------------------------------+  |
+                                   +------------------------------------+
+                                                  |
+                                                  | MQTT
+                                                  |
+                                  +---------------+-----------------+
+                                  |               |                 |
+                          +-------v----+  +-------v----+  +-------v----+
+                          |Pi arm1     |  |Pi arm2     |  |Pi armN     |
+                          |role=arm    |  |role=arm    |  |role=arm    |
+                          +------------+  +------------+  +------------+
+                          |pubsub_agent|  |pubsub_agent|  |pubsub_agent|
+                          |- state:    |  |- state:    |  |- state:    |
+                          |  fleet/.../|  |  fleet/.../|  |  fleet/.../|
+                          |  state     |  |  state     |  |  state     |
+                          |- cmd:      |  |- cmd:      |  |- cmd:      |
+                          |  fleet/.../|  |  fleet/.../|  |  fleet/.../|
+                          |  cmd       |  |  cmd       |  |  cmd       |
+                          |- SG90 GPIO |  |- SG90 GPIO |  |- SG90 GPIO |
+                          |- local     |  |- local     |  |- local     |
+                          |  safe-stop |  |  safe-stop |  |  safe-stop |
+                          +------------+  +------------+  +------------+
+```
+
 ## Layout
 
 ```
@@ -49,6 +82,82 @@ cd pi-agent && pip install -r requirements.txt && ROBOT_ID=arm1 python pubsub_ag
 
 You need an MQTT broker (e.g. local Mosquitto). The same flow scales to many
 robots: add more `ROBOT_ID` instances and set `ROBOTS` on the gateway.
+
+## Running the full stack (k3s)
+
+Deploy the centralized OPC UA fleet to real hardware using the k3s manifest.
+
+### Prerequisites
+
+- One DGX Spark (control plane) and one or more Raspberry Pis (agents).
+- Install k3s:
+
+  ```sh
+  # On Spark (server):
+  curl -sfL https://get.k3s.io | sh -
+
+  # On each Pi (agent, replace <spark-ip>):
+  curl -sfL https://get.k3s.io | K3S_URL=https://<spark-ip>:6443 K3S_TOKEN=<token> sh -
+  ```
+
+- Label the nodes so workloads land on the correct hardware:
+
+  ```sh
+  kubectl label node <pi-hostname>    role=arm
+  kubectl label node <spark-hostname> role=edge
+  ```
+
+  See `deploy/k3s/k3s-opcua-stack.yaml` header for more details.
+
+### Build and push container images
+
+- Build the gateway image on the Spark:
+
+  ```sh
+  cd spark-gateway && docker build -t your-registry/spark-gateway:latest .
+  docker push your-registry/spark-gateway:latest
+  ```
+
+- Build the Pi agent image on a Pi (or cross-build for arm64):
+
+  ```sh
+  cd pi-agent && docker build -t your-registry/pi-agent:latest .
+  docker push your-registry/pi-agent:latest
+  ```
+
+- Update `deploy/k3s/k3s-opcua-stack.yaml` if your registry or image tags differ.
+
+### Configure the fleet
+
+- Edit the `opcua-config` ConfigMap in `deploy/k3s/k3s-opcua-stack.yaml`:
+
+  - `ROBOTS`: comma-separated robot IDs (`arm1` for one, `arm1,arm2,arm3` for many).
+  - Keep `MQTT_HOST=mqtt-broker`, `MQTT_PORT=1883`, `OPCUA_PORT=4840`.
+
+- For each additional robot, deploy a separate `pi-agent` Deployment with a
+  distinct `ROBOT_ID` (the manifest header explains the pattern).
+
+### Apply the stack
+
+```sh
+kubectl apply -f deploy/k3s/k3s-opcua-stack.yaml
+```
+
+### Verify
+
+```sh
+kubectl -n edge-opcua get pods
+```
+
+Confirm `mqtt-broker`, `spark-gateway`, and `pi-agent` (plus optional `ros2-opcua-bridge`, `opcua-ai-results-server`) are Running.
+
+- Use UaExpert (or any OPC UA client) to connect to the fleet endpoint:
+  `opc.tcp://<spark-host>:4840/fleet/`
+- You should see one node per robot (Arm1, Arm2, … ArmN), each with per-joint
+  target and state nodes.
+
+This single flow works for one robot or many; only the `ROBOTS` list and number
+of `pi-agent` Deployments change—the topology stays centralized.
 
 ## On hardware
 
