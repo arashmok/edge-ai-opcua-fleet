@@ -173,12 +173,49 @@ PAGE = """<!doctype html>
   .btn-stop{background:var(--bad);flex:1;}
   .btn-stop.armed{background:#7a2426;}
   .status{font-size:12px;color:var(--mut);margin-top:12px;}
+  .viz{position:relative;}
+  .viz svg{width:100%;height:auto;display:block;background:#111a2b;border-radius:12px;}
+  .viz .cap{display:flex;justify-content:space-between;color:var(--mut);font-size:12px;margin-bottom:8px;}
+  .link{stroke-linecap:round;transition:transform .3s ease;}
+  #upper,#fore,#jawA,#jawB,#needle{transition:transform .3s ease;}
+  .lbl{fill:var(--mut);font:600 11px system-ui,sans-serif;}
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>Fleet OT Client — <span style="text-transform:capitalize">__ROBOT__</span></h1>
   <div class="sub">OPC UA endpoint: __ENDPOINT__</div>
+  <div class="card viz">
+    <div class="cap"><span>Live arm (mirrors reported state)</span><span id="vizStop"></span></div>
+    <svg id="arm" viewBox="0 0 340 300" preserveAspectRatio="xMidYMid meet">
+      <!-- ground + base column -->
+      <line x1="30" y1="250" x2="250" y2="250" stroke="#26314a" stroke-width="3"/>
+      <rect x="104" y="212" width="32" height="40" rx="4" fill="#26314a"/>
+      <ellipse cx="120" cy="212" rx="26" ry="7" fill="#33405c"/>
+      <!-- kinematic chain: shoulder pivot at (120,210) -->
+      <g transform="translate(120,210)">
+        <g id="upper">
+          <line class="link" x1="0" y1="0" x2="90" y2="0" stroke="#4f8cff" stroke-width="12"/>
+          <circle cx="0" cy="0" r="7" fill="#e6ebf5"/>
+          <g id="fore" transform="translate(90,0)">
+            <line class="link" x1="0" y1="0" x2="75" y2="0" stroke="#6ba0ff" stroke-width="9"/>
+            <circle cx="0" cy="0" r="6" fill="#e6ebf5"/>
+            <g transform="translate(75,0)">
+              <g id="jawA"><line class="link" x1="0" y1="0" x2="24" y2="0" stroke="#9ec2ff" stroke-width="6"/></g>
+              <g id="jawB"><line class="link" x1="0" y1="0" x2="24" y2="0" stroke="#9ec2ff" stroke-width="6"/></g>
+            </g>
+          </g>
+        </g>
+      </g>
+      <!-- base yaw dial (top-down) -->
+      <g transform="translate(292,54)">
+        <circle cx="0" cy="0" r="30" fill="#0f1420" stroke="#33405c" stroke-width="2"/>
+        <g id="needle"><line x1="0" y1="0" x2="0" y2="-24" stroke="#28c76f" stroke-width="3"/></g>
+        <circle cx="0" cy="0" r="3" fill="#e6ebf5"/>
+        <text x="0" y="46" text-anchor="middle" class="lbl">base yaw</text>
+      </g>
+    </svg>
+  </div>
   <div class="card" id="joints">connecting…</div>
   <div class="card">
     <div class="row">
@@ -189,8 +226,22 @@ PAGE = """<!doctype html>
   </div>
 </div>
 <script>
-let joints=[], dragging={}, stopOn=false;
+let joints=[], dragging={}, stopOn=false, latest={};
 const $=(id)=>document.getElementById(id);
+const num=(v,d)=>(v===undefined||v===null||isNaN(v))?d:Number(v);
+function renderArm(a){
+  const R1=-(num(a.pitch,90)-90);          // shoulder: higher angle -> raise
+  const R2=-(num(a.reach,90)-90);          // elbow: relative to upper arm
+  const half=4+(num(a.gripper,90)/180)*34; // jaw half-open 4..38 deg
+  const yaw=num(a.base,90)-90;             // base yaw shown on dial
+  const up=$('upper'),fo=$('fore'),ja=$('jawA'),jb=$('jawB'),nd=$('needle');
+  if(!up) return;
+  up.setAttribute('transform',`rotate(${R1})`);
+  fo.setAttribute('transform',`translate(90,0) rotate(${R2})`);
+  ja.setAttribute('transform',`rotate(${-half})`);
+  jb.setAttribute('transform',`rotate(${half})`);
+  nd.setAttribute('transform',`rotate(${yaw})`);
+}
 async function api(path,opts){
   const r=await fetch(path,opts);
   const j=await r.json().catch(()=>({}));
@@ -213,9 +264,11 @@ async function build(){
       <div class="st" id="st-${j}">↺ ${s.state[j].toFixed(0)}°</div>`;
     c.appendChild(row);
     const sl=$(`sl-${j}`);
-    sl.addEventListener('input',()=>{dragging[j]=true; $(`v-${j}`).textContent=sl.value+'°';});
+    sl.addEventListener('input',()=>{dragging[j]=true; $(`v-${j}`).textContent=sl.value+'°'; latest[j]=Number(sl.value); renderArm(latest);});
     sl.addEventListener('change',async()=>{dragging[j]=false; try{await setJoint(j,sl.value);}catch(e){}});
   }
+  latest=Object.assign({},s.state);
+  renderArm(latest);
 }
 async function poll(){
   try{
@@ -223,10 +276,14 @@ async function poll(){
     for(const j of joints){
       $(`st-${j}`).textContent='↺ '+s.state[j].toFixed(0)+'°';
       if(!dragging[j]){ $(`sl-${j}`).value=s.target[j]; $(`v-${j}`).textContent=s.target[j].toFixed(0)+'°'; }
+      if(!dragging[j]) latest[j]=s.state[j];
     }
+    renderArm(latest);
     stopOn=s.safe_stop;
     const b=$('stopBtn'); b.classList.toggle('armed',stopOn);
     b.textContent=stopOn?'SAFE-STOP is ON — click to clear':'SAFE-STOP';
+    $('vizStop').textContent=stopOn?'SAFE-STOP ON':'';
+    $('vizStop').style.color=stopOn?'var(--bad)':'var(--mut)';
     $('status').textContent='connected · updated '+new Date().toLocaleTimeString();
   }catch(e){ $('status').textContent='gateway unreachable: '+e.message; }
 }
