@@ -183,17 +183,15 @@ PAGE = """<!doctype html>
   .btn-stop.armed{background:#7a2426;}
   .status{font-size:12px;color:var(--mut);margin-top:12px;}
   .viz{position:relative;}
-  .viz svg{width:100%;height:auto;display:block;background:#111a2b;border-radius:12px;}
   .viz .cap{display:flex;justify-content:space-between;color:var(--mut);font-size:12px;margin-bottom:8px;}
-  .viz.off svg{opacity:.35;filter:grayscale(1);}
-  .viz.off{position:relative;}
+  .scene{width:100%;height:340px;border-radius:12px;overflow:hidden;background:#0c1524;}
+  .scene canvas{display:block;width:100%!important;height:100%!important;}
+  .viz.off .scene{opacity:.3;filter:grayscale(1);}
   .viz .offbadge{display:none;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
     background:var(--bad);color:#fff;font-weight:700;letter-spacing:.05em;padding:8px 16px;border-radius:10px;
-    box-shadow:0 6px 20px rgba(0,0,0,.4);}
+    box-shadow:0 6px 20px rgba(0,0,0,.4);z-index:5;}
   .viz.off .offbadge{display:block;}
-  .link{stroke-linecap:round;transition:transform .3s ease;}
-  #upper,#fore,#jawA,#jawB,#needle{transition:transform .3s ease;}
-  .lbl{fill:var(--mut);font:600 11px system-ui,sans-serif;}
+  .hint{color:var(--mut);font-size:11px;margin-top:6px;text-align:center;}
 </style>
 </head>
 <body>
@@ -201,36 +199,10 @@ PAGE = """<!doctype html>
   <h1>Fleet OT Client — <span style="text-transform:capitalize">__ROBOT__</span></h1>
   <div class="sub">OPC UA endpoint: __ENDPOINT__</div>
   <div class="card viz">
-    <div class="cap"><span>Live arm (mirrors reported state)</span><span id="vizHealth"></span></div>
-    <svg id="arm" viewBox="0 0 340 300" preserveAspectRatio="xMidYMid meet">
-      <!-- ground + base column -->
-      <line x1="30" y1="250" x2="250" y2="250" stroke="#26314a" stroke-width="3"/>
-      <rect x="104" y="212" width="32" height="40" rx="4" fill="#26314a"/>
-      <ellipse cx="120" cy="212" rx="26" ry="7" fill="#33405c"/>
-      <!-- kinematic chain: shoulder pivot at (120,210) -->
-      <g transform="translate(120,210)">
-        <g id="upper">
-          <line class="link" x1="0" y1="0" x2="90" y2="0" stroke="#4f8cff" stroke-width="12"/>
-          <circle cx="0" cy="0" r="7" fill="#e6ebf5"/>
-          <g id="fore" transform="translate(90,0)">
-            <line class="link" x1="0" y1="0" x2="75" y2="0" stroke="#6ba0ff" stroke-width="9"/>
-            <circle cx="0" cy="0" r="6" fill="#e6ebf5"/>
-            <g transform="translate(75,0)">
-              <g id="jawA"><line class="link" x1="0" y1="0" x2="24" y2="0" stroke="#9ec2ff" stroke-width="6"/></g>
-              <g id="jawB"><line class="link" x1="0" y1="0" x2="24" y2="0" stroke="#9ec2ff" stroke-width="6"/></g>
-            </g>
-          </g>
-        </g>
-      </g>
-      <!-- base yaw dial (top-down) -->
-      <g transform="translate(292,54)">
-        <circle cx="0" cy="0" r="30" fill="#0f1420" stroke="#33405c" stroke-width="2"/>
-        <g id="needle"><line x1="0" y1="0" x2="0" y2="-24" stroke="#28c76f" stroke-width="3"/></g>
-        <circle cx="0" cy="0" r="3" fill="#e6ebf5"/>
-        <text x="0" y="46" text-anchor="middle" class="lbl">base yaw</text>
-      </g>
-    </svg>
+    <div class="cap"><span>Live arm (3D · mirrors reported state)</span><span id="vizHealth"></span></div>
+    <div class="scene" id="scene"></div>
     <div class="offbadge">ARM OFFLINE</div>
+    <div class="hint">drag to orbit · scroll to zoom</div>
   </div>
   <div class="card" id="joints">connecting…</div>
   <div class="card">
@@ -245,19 +217,7 @@ PAGE = """<!doctype html>
 let joints=[], dragging={}, stopOn=false, latest={};
 const $=(id)=>document.getElementById(id);
 const num=(v,d)=>(v===undefined||v===null||isNaN(v))?d:Number(v);
-function renderArm(a){
-  const R1=-(num(a.pitch,90)-90);          // shoulder: higher angle -> raise
-  const R2=-(num(a.reach,90)-90);          // elbow: relative to upper arm
-  const half=4+(num(a.gripper,90)/180)*34; // jaw half-open 4..38 deg
-  const yaw=num(a.base,90)-90;             // base yaw shown on dial
-  const up=$('upper'),fo=$('fore'),ja=$('jawA'),jb=$('jawB'),nd=$('needle');
-  if(!up) return;
-  up.setAttribute('transform',`rotate(${R1})`);
-  fo.setAttribute('transform',`translate(90,0) rotate(${R2})`);
-  ja.setAttribute('transform',`rotate(${-half})`);
-  jb.setAttribute('transform',`rotate(${half})`);
-  nd.setAttribute('transform',`rotate(${yaw})`);
-}
+function renderArm(a){ if(window.updateArm3D) window.updateArm3D(a); }
 async function api(path,opts){
   const r=await fetch(path,opts);
   const j=await r.json().catch(()=>({}));
@@ -313,6 +273,132 @@ async function toggleStop(){ try{ await api('/api/safe_stop',{method:'POST',
   headers:{'Content-Type':'application/json'},body:JSON.stringify({on:!stopOn})}); }catch(e){} poll(); }
 (async()=>{ try{await build();}catch(e){ $('joints').textContent='cannot reach gateway: '+e.message; }
   setInterval(poll,800); })();
+</script>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const host = document.getElementById('scene');
+const d2r = THREE.MathUtils.degToRad;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0c1524);
+
+const camera = new THREE.PerspectiveCamera(45, host.clientWidth/host.clientHeight, 0.1, 100);
+camera.position.set(3.2, 2.6, 3.4);
+
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(host.clientWidth, host.clientHeight);
+host.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enablePan = false;
+controls.minDistance = 2.5;
+controls.maxDistance = 9;
+controls.maxPolarAngle = Math.PI * 0.49;
+controls.target.set(0, 1.1, 0);
+controls.update();
+
+// lights
+scene.add(new THREE.HemisphereLight(0xbfd4ff, 0x1a2233, 1.0));
+const key = new THREE.DirectionalLight(0xffffff, 1.1);
+key.position.set(4, 6, 3);
+scene.add(key);
+
+// ground grid + floor pad
+const grid = new THREE.GridHelper(10, 20, 0x2a3b57, 0x1c273c);
+grid.material.opacity = 0.5; grid.material.transparent = true;
+scene.add(grid);
+
+const mat = (c) => new THREE.MeshStandardMaterial({ color:c, metalness:0.25, roughness:0.55 });
+const COL = { base:0x33405c, post:0x3a4a6a, upper:0x4f8cff, fore:0x6ba0ff, jaw:0x9ec2ff, joint:0xe6ebf5 };
+const joint = (r) => new THREE.Mesh(new THREE.SphereGeometry(r, 20, 16), mat(COL.joint));
+
+// --- kinematic chain (Y up) ---
+// baseGroup: yaw about Y carries the whole arm around
+const baseGroup = new THREE.Group();
+scene.add(baseGroup);
+
+const basePad = new THREE.Mesh(new THREE.CylinderGeometry(0.85, 0.95, 0.18, 40), mat(COL.base));
+basePad.position.y = 0.09; baseGroup.add(basePad);
+const turntable = new THREE.Mesh(new THREE.CylinderGeometry(0.6, 0.6, 0.12, 40), mat(COL.post));
+turntable.position.y = 0.24; baseGroup.add(turntable);
+const post = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.2, 0.7, 24), mat(COL.post));
+post.position.y = 0.6; baseGroup.add(post);
+// a marker so base yaw is obvious even when the arm is centered
+const marker = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.06, 0.5), mat(COL.upper));
+marker.position.set(0, 0.33, 0.42); baseGroup.add(marker);
+
+// shoulder pivot on top of the post
+const L1 = 1.15, L2 = 0.95;
+const shoulder = new THREE.Group();
+shoulder.position.set(0, 0.95, 0);
+baseGroup.add(shoulder);
+shoulder.add(joint(0.15));
+const upper = new THREE.Mesh(new THREE.BoxGeometry(0.2, L1, 0.2), mat(COL.upper));
+upper.position.y = L1/2; shoulder.add(upper);
+
+// elbow at the end of the upper arm
+const elbow = new THREE.Group();
+elbow.position.y = L1;
+shoulder.add(elbow);
+elbow.add(joint(0.12));
+const fore = new THREE.Mesh(new THREE.BoxGeometry(0.16, L2, 0.16), mat(COL.fore));
+fore.position.y = L2/2; elbow.add(fore);
+
+// gripper at the end of the forearm: two jaws that open/close
+const wrist = new THREE.Group();
+wrist.position.y = L2;
+elbow.add(wrist);
+wrist.add(joint(0.09));
+const jawA = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.26, 0.08), mat(COL.jaw));
+const jawB = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.26, 0.08), mat(COL.jaw));
+jawA.position.set(0, 0.13, 0); jawB.position.set(0, 0.13, 0);
+wrist.add(jawA); wrist.add(jawB);
+
+// smoothed joint state (radians / metres)
+const cur = { yaw:0, pitch:d2r(90), elbow:0, jaw:0.06 };
+const tgt = { ...cur };
+
+window.updateArm3D = (a) => {
+  if(!a) return;
+  const g = (v,d)=> (v===undefined||v===null||isNaN(v)) ? d : Number(v);
+  tgt.yaw   = d2r(g(a.base,90) - 90);        // base -> yaw about Y
+  tgt.pitch = d2r(180 - g(a.pitch,90));      // higher pitch -> arm more upright
+  tgt.elbow = d2r(180 - g(a.reach,90));      // reach -> forearm bend (relative)
+  tgt.jaw   = 0.03 + (g(a.gripper,90)/180) * 0.22; // gripper -> jaw gap
+};
+
+function onResize(){
+  const w = host.clientWidth, h = host.clientHeight;
+  camera.aspect = w/h; camera.updateProjectionMatrix();
+  renderer.setSize(w, h);
+}
+window.addEventListener('resize', onResize);
+
+function animate(){
+  requestAnimationFrame(animate);
+  const k = 0.15; // critically-ish damped lerp toward target
+  cur.yaw   += (tgt.yaw   - cur.yaw)   * k;
+  cur.pitch += (tgt.pitch - cur.pitch) * k;
+  cur.elbow += (tgt.elbow - cur.elbow) * k;
+  cur.jaw   += (tgt.jaw   - cur.jaw)   * k;
+  baseGroup.rotation.y = cur.yaw;
+  shoulder.rotation.x  = cur.pitch;
+  elbow.rotation.x     = cur.elbow;
+  jawA.position.z =  cur.jaw/2;
+  jawB.position.z = -cur.jaw/2;
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
 </script>
 </body>
 </html>
