@@ -25,6 +25,8 @@ Env (all optional):
   ANGLE_MIN / ANGLE_MAX   default 0 / 180
   WATCHDOG_S     stale-command timeout, default 2.0
   STATE_HZ       state publish rate,    default 5
+  IDLE_RELEASE_S seconds a target must be stable before the servo pulse is cut
+                 so it stops buzzing at rest; 0 = always hold. default 0.5
 """
 
 import json
@@ -48,6 +50,10 @@ ANGLE_MIN = float(os.getenv("ANGLE_MIN", "0"))
 ANGLE_MAX = float(os.getenv("ANGLE_MAX", "180"))
 WATCHDOG_S = float(os.getenv("WATCHDOG_S", "2.0"))
 STATE_HZ = float(os.getenv("STATE_HZ", "5"))
+# Software PWM (lgpio) jitters a few us, so a held servo keeps micro-correcting
+# and buzzes. Once a target has been stable for IDLE_RELEASE_S, cut the pulse so
+# the servo de-energizes and goes silent. Set to 0 to always hold (with buzz).
+IDLE_RELEASE_S = float(os.getenv("IDLE_RELEASE_S", "0.5"))
 # BCM GPIO pins, one per joint. Default is a conflict-free set on the Pi 4
 # 40-pin header (BCM 17,27,22,23 = physical pins 11,13,15,16); these avoid the
 # I2C/SPI/UART/I2S buses. lgpio drives software PWM on any GPIO via /dev/gpiochip.
@@ -118,16 +124,35 @@ class Agent:
 
     def control_loop(self):
         """Drive servos and enforce the local safe-stop. Runs even if the
-        broker or gateway is unreachable."""
+        broker or gateway is unreachable.
+
+        Cheap servos on software PWM buzz while actively held, so once a target
+        has been stable for IDLE_RELEASE_S we cut the pulse and the servo goes
+        limp/silent until the target changes again (IDLE_RELEASE_S=0 to hold).
+        """
+        last_targets = None
+        settled_at = 0.0
         while True:
+            now = time.monotonic()
             with self.lock:
                 stopped = self.safe_stop
                 connected = self.connected
-                stale = (time.monotonic() - self.last_cmd_time) > WATCHDOG_S
+                stale = (now - self.last_cmd_time) > WATCHDOG_S
                 targets = dict(self.state)
             if stopped or stale or not connected:
                 self.driver.release_all()
+                last_targets = None
+            elif targets != last_targets:
+                # Target moved: drive to it and start the settle timer.
+                last_targets = targets
+                settled_at = now
+                for j in JOINTS:
+                    self.driver.set_angle(self.channel_of[j], targets[j])
+            elif IDLE_RELEASE_S > 0 and (now - settled_at) > IDLE_RELEASE_S:
+                # Held long enough: cut the pulse so the servo stops buzzing.
+                self.driver.release_all()
             else:
+                # Within the settle window: keep driving to reach/hold.
                 for j in JOINTS:
                     self.driver.set_angle(self.channel_of[j], targets[j])
             time.sleep(0.05)
