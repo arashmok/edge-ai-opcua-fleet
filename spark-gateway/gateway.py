@@ -35,6 +35,7 @@ Env (all optional):
 import asyncio
 import logging
 import os
+import time
 
 import paho.mqtt.client as mqtt
 from asyncua import Server
@@ -50,6 +51,10 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 ROBOTS = os.getenv("ROBOTS", "arm1,arm2,arm3").split(",")
 JOINTS = os.getenv("ARM_JOINTS", "base,pitch,reach,gripper").split(",")
 CMD_HZ = float(os.getenv("CMD_HZ", "10"))
+# A robot is "online" only while its reported state keeps arriving. If no
+# DSW_STATE message is decoded within STALE_S seconds (agent unplugged, crashed,
+# or link lost) the gateway marks it offline so OT clients can react.
+STALE_S = float(os.getenv("STALE_S", "3.0"))
 
 
 class Gateway:
@@ -58,8 +63,11 @@ class Gateway:
         self.target_nodes = {}       # (robot, joint) -> writable node
         self.state_nodes = {}        # (robot, joint) -> read-only node
         self.robot_stop_nodes = {}   # robot -> writable safe_stop node
+        self.online_nodes = {}       # robot -> read-only online (liveness) node
         self.fleet_stop_node = None  # fleet-wide writable safe_stop node
         self.cmd_seq = {robot: 0 for robot in ROBOTS}
+        # monotonic timestamp of the last decoded state per robot; 0 => never
+        self.last_state = {robot: 0.0 for robot in ROBOTS}
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
                                   client_id="fleet-gateway")
         self.client.on_connect = self._on_connect
@@ -82,6 +90,8 @@ class Gateway:
             stop_node = await robot_obj.add_variable(idx, "safe_stop", False)
             await stop_node.set_writable()
             self.robot_stop_nodes[robot] = stop_node
+            online_node = await robot_obj.add_variable(idx, "online", False)
+            self.online_nodes[robot] = online_node
             for joint in JOINTS:
                 jnode = await robot_obj.add_object(idx, joint)
                 tnode = await jnode.add_variable(idx, "target", 90.0)
@@ -104,6 +114,8 @@ class Gateway:
         robot = decoded.get("publisher_id")
         for ds in decoded.get("datasets", []):
             if ds.get("writer_id") == DSW_STATE:
+                if robot in self.last_state:
+                    self.last_state[robot] = time.monotonic()
                 joints = ds.get("fields", {})
                 asyncio.run_coroutine_threadsafe(
                     self._apply_state(robot, joints), self.loop)
@@ -113,6 +125,19 @@ class Gateway:
             node = self.state_nodes.get((robot, joint))
             if node is not None:
                 await node.write_value(float(val))
+
+    # ---- Liveness: flip each robot's online node on state freshness ----
+    async def health_loop(self):
+        period = min(1.0, STALE_S / 2.0)
+        while True:
+            now = time.monotonic()
+            for robot in ROBOTS:
+                fresh = (now - self.last_state[robot]) < STALE_S
+                node = self.online_nodes[robot]
+                if bool(await node.read_value()) != fresh:
+                    await node.write_value(fresh)
+                    log.info("robot %s online=%s", robot, fresh)
+            await asyncio.sleep(period)
 
     # ---- North to south: stream setpoints + safe_stop to each robot ----
     async def publish_loop(self):
@@ -140,7 +165,7 @@ class Gateway:
         self.client.loop_start()
         async with self.server:
             log.info("OPC UA fleet endpoint on port %s, robots=%s", PORT, ROBOTS)
-            await self.publish_loop()
+            await asyncio.gather(self.publish_loop(), self.health_loop())
 
 
 if __name__ == "__main__":

@@ -42,6 +42,7 @@ class Fleet:
         self._client = None
         self._targets = {}
         self._states = {}
+        self._online = None
         self._stop = None
         self._lock = asyncio.Lock()
 
@@ -56,6 +57,11 @@ class Fleet:
                 [f"{idx}:{ROBOT}", f"{idx}:{j}", f"{idx}:state"])
         self._stop = await client.nodes.objects.get_child(
             [f"{idx}:{ROBOT}", f"{idx}:safe_stop"])
+        try:
+            self._online = await client.nodes.objects.get_child(
+                [f"{idx}:{ROBOT}", f"{idx}:online"])
+        except Exception:  # noqa: BLE001 - older gateway without liveness node
+            self._online = None
         self._client = client
 
     async def _reset(self):
@@ -97,7 +103,10 @@ class Fleet:
                      for j in JOINTS}
             target = {j: round(float(await self._targets[j].read_value()), 1)
                       for j in JOINTS}
-            return {"state": state, "target": target,
+            online = True
+            if self._online is not None:
+                online = bool(await self._online.read_value())
+            return {"state": state, "target": target, "online": online,
                     "safe_stop": bool(await self._stop.read_value())}
         return await self._run(op)
 
@@ -176,6 +185,12 @@ PAGE = """<!doctype html>
   .viz{position:relative;}
   .viz svg{width:100%;height:auto;display:block;background:#111a2b;border-radius:12px;}
   .viz .cap{display:flex;justify-content:space-between;color:var(--mut);font-size:12px;margin-bottom:8px;}
+  .viz.off svg{opacity:.35;filter:grayscale(1);}
+  .viz.off{position:relative;}
+  .viz .offbadge{display:none;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+    background:var(--bad);color:#fff;font-weight:700;letter-spacing:.05em;padding:8px 16px;border-radius:10px;
+    box-shadow:0 6px 20px rgba(0,0,0,.4);}
+  .viz.off .offbadge{display:block;}
   .link{stroke-linecap:round;transition:transform .3s ease;}
   #upper,#fore,#jawA,#jawB,#needle{transition:transform .3s ease;}
   .lbl{fill:var(--mut);font:600 11px system-ui,sans-serif;}
@@ -186,7 +201,7 @@ PAGE = """<!doctype html>
   <h1>Fleet OT Client — <span style="text-transform:capitalize">__ROBOT__</span></h1>
   <div class="sub">OPC UA endpoint: __ENDPOINT__</div>
   <div class="card viz">
-    <div class="cap"><span>Live arm (mirrors reported state)</span><span id="vizStop"></span></div>
+    <div class="cap"><span>Live arm (mirrors reported state)</span><span id="vizHealth"></span></div>
     <svg id="arm" viewBox="0 0 340 300" preserveAspectRatio="xMidYMid meet">
       <!-- ground + base column -->
       <line x1="30" y1="250" x2="250" y2="250" stroke="#26314a" stroke-width="3"/>
@@ -215,6 +230,7 @@ PAGE = """<!doctype html>
         <text x="0" y="46" text-anchor="middle" class="lbl">base yaw</text>
       </g>
     </svg>
+    <div class="offbadge">ARM OFFLINE</div>
   </div>
   <div class="card" id="joints">connecting…</div>
   <div class="card">
@@ -280,11 +296,16 @@ async function poll(){
     }
     renderArm(latest);
     stopOn=s.safe_stop;
+    const online=s.online!==false;
+    const viz=document.querySelector('.viz');
+    viz.classList.toggle('off',!online);
+    for(const j of joints){ $(`sl-${j}`).disabled=!online; }
+    const h=$('vizHealth');
+    h.textContent = !online ? 'OFFLINE' : (stopOn?'SAFE-STOP ON':'online');
+    h.style.color = (!online||stopOn) ? 'var(--bad)' : 'var(--ok)';
     const b=$('stopBtn'); b.classList.toggle('armed',stopOn);
     b.textContent=stopOn?'SAFE-STOP is ON — click to clear':'SAFE-STOP';
-    $('vizStop').textContent=stopOn?'SAFE-STOP ON':'';
-    $('vizStop').style.color=stopOn?'var(--bad)':'var(--mut)';
-    $('status').textContent='connected · updated '+new Date().toLocaleTimeString();
+    $('status').textContent=(online?'connected':'ARM OFFLINE — gateway up, agent not reporting')+' · updated '+new Date().toLocaleTimeString();
   }catch(e){ $('status').textContent='gateway unreachable: '+e.message; }
 }
 async function centerAll(){ for(const j of joints){ try{await setJoint(j,90);}catch(e){} } }
