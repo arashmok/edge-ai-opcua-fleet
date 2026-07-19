@@ -276,17 +276,54 @@ stays installed.
 
 ## On hardware
 
-- Servo signal wires go to Pi GPIO pins. The default is BCM `17,27,22,23`
-  (Raspberry Pi 4 physical header pins 11, 13, 15, 16) — a conflict-free set
-  clear of the I2C/SPI/UART/I2S buses. Override with `ARM_CHANNELS` if needed.
-  lgpio drives software PWM on any GPIO via `/dev/gpiochip`, so hardware-PWM
-  pins are not required.
-- Servos get a SEPARATE 5V supply, never the Pi 5V pin. Tie all grounds together.
+### Servo wiring (default pin map)
+
+Each joint is paired to a GPIO by list order (`ARM_JOINTS` zipped with
+`ARM_CHANNELS`). With the defaults, connect each servo's **signal** wire to:
+
+| Joint (role) | BCM GPIO | Physical header pin |
+|---|---|---|
+| `base` | GPIO 17 | pin 11 |
+| `pitch` | GPIO 27 | pin 13 |
+| `reach` | GPIO 22 | pin 15 |
+| `gripper` | GPIO 23 | pin 16 |
+
+They cluster on the right edge of the 40-pin header (numbering is the same on
+Pi 4 and Pi 5):
+
+```text
+          3V3  (1) (2)  5V
+        GPIO2  (3) (4)  5V
+        GPIO3  (5) (6)  GND
+        GPIO4  (7) (8)  GPIO14
+          GND  (9) (10) GPIO15
+  base → GPIO17 (11)(12) GPIO18
+ pitch → GPIO27 (13)(14) GND          <- common-ground pin (handy)
+ reach → GPIO22 (15)(16) GPIO23 <- gripper
+          3V3 (17)(18) GPIO24
+```
+
+Per servo, 3 wires: **signal** → the GPIO pin above; **V+ (red)** → a SEPARATE
+5V supply (never the Pi 5V pin); **GND** → the servo supply ground **and** a Pi
+GND pin (they must share a ground — e.g. pin 9, 14, 20, or 25).
+
+Order is positional, so to remap without rewiring just reorder `ARM_CHANNELS`
+to match `ARM_JOINTS` (e.g. `ARM_CHANNELS="23,22,27,17"` drives `base` on the
+gripper pin). The set BCM `17,27,22,23` is deliberately clear of the
+I2C/SPI/UART/I2S buses; lgpio drives software PWM on any GPIO via
+`/dev/gpiochip`, so hardware-PWM pins are not required.
+
+### Notes
+
 - lgpio needs no daemon (unlike pigpio); just make sure the agent's user can
   reach `/dev/gpiochip*` (the `gpio` group on Raspberry Pi OS, or a privileged
   container). Works on Raspberry Pi OS Bookworm/Trixie and on the Pi 5.
-- Note: SG90 servos are open loop, so reported state is the commanded angle, not
+- SG90 servos are open loop, so reported state is the commanded angle, not
   measured. The local safe-stop on each Pi runs independently of the network.
+- Software PWM jitters slightly, so a held servo can buzz. The agent releases a
+  joint after `IDLE_RELEASE_S` (default 0.5s) of no change so it goes quiet; set
+  `IDLE_RELEASE_S=0` to always hold. For jitter-free multi-servo holding, drive
+  the servos from a hardware PWM board (e.g. a PCA9685 over I2C).
 
 See `docs/getting-started.md` for the full phased build and `docs/architecture.md`
 for the design rationale.
