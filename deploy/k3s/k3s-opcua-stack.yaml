@@ -129,6 +129,10 @@ metadata:
     tier: gateway
 spec:
   replicas: 1
+  # hostNetwork + hostPort 4840 means two pods can't run at once on the node,
+  # so a rolling update would deadlock; Recreate stops the old pod first.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: spark-gateway
@@ -141,6 +145,7 @@ spec:
       nodeSelector:
         role: edge                # pin to the Spark
       hostNetwork: true           # so OPC UA discovery and the OPC UA port work cleanly
+      dnsPolicy: ClusterFirstWithHostNet   # keep cluster DNS so MQTT_HOST=mqtt-broker resolves
       containers:
         - name: spark-gateway
           image: your-registry/spark-gateway:latest
