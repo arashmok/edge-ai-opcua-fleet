@@ -27,6 +27,8 @@ Env (all optional):
   STATE_HZ       state publish rate,    default 5
   IDLE_RELEASE_S seconds a target must be stable before the servo pulse is cut
                  so it stops buzzing at rest; 0 = always hold. default 0.5
+  HOLD_JOINTS    joints that must always hold (never idle-release) because they
+                 bear load and would sag, e.g. "pitch,reach". default none
 """
 
 import json
@@ -54,6 +56,10 @@ STATE_HZ = float(os.getenv("STATE_HZ", "5"))
 # and buzzes. Once a target has been stable for IDLE_RELEASE_S, cut the pulse so
 # the servo de-energizes and goes silent. Set to 0 to always hold (with buzz).
 IDLE_RELEASE_S = float(os.getenv("IDLE_RELEASE_S", "0.5"))
+# Joints that must HOLD position (never idle-release) because they bear load and
+# would sag if de-energized (e.g. a shoulder/elbow). They keep a steady pulse
+# (may buzz slightly); the rest still idle-release for quiet. Comma list.
+HOLD_JOINTS = {j for j in os.getenv("HOLD_JOINTS", "").split(",") if j}
 # BCM GPIO pins, one per joint. Default is a conflict-free set on the Pi 4
 # 40-pin header (BCM 17,27,22,23 = physical pins 11,13,15,16); these avoid the
 # I2C/SPI/UART/I2S buses. lgpio drives software PWM on any GPIO via /dev/gpiochip.
@@ -126,12 +132,14 @@ class Agent:
         """Drive servos and enforce the local safe-stop. Runs even if the
         broker or gateway is unreachable.
 
-        Cheap servos on software PWM buzz while actively held, so once a target
-        has been stable for IDLE_RELEASE_S we cut the pulse and the servo goes
-        limp/silent until the target changes again (IDLE_RELEASE_S=0 to hold).
+        Each joint is handled INDEPENDENTLY so moving one does not disturb the
+        others. A joint whose target has been stable for IDLE_RELEASE_S is
+        released (pulse cut) so it goes silent, and re-driven only when ITS OWN
+        target changes. Joints in HOLD_JOINTS are never released (they hold
+        against load, accepting some software-PWM buzz).
         """
-        last_targets = None
-        settled_at = 0.0
+        last = {j: None for j in JOINTS}      # last driven angle per joint
+        settled = {j: 0.0 for j in JOINTS}    # when this joint reached target
         while True:
             now = time.monotonic()
             with self.lock:
@@ -141,20 +149,24 @@ class Agent:
                 targets = dict(self.state)
             if stopped or stale or not connected:
                 self.driver.release_all()
-                last_targets = None
-            elif targets != last_targets:
-                # Target moved: drive to it and start the settle timer.
-                last_targets = targets
-                settled_at = now
                 for j in JOINTS:
-                    self.driver.set_angle(self.channel_of[j], targets[j])
-            elif IDLE_RELEASE_S > 0 and (now - settled_at) > IDLE_RELEASE_S:
-                # Held long enough: cut the pulse so the servo stops buzzing.
-                self.driver.release_all()
-            else:
-                # Within the settle window: keep driving to reach/hold.
-                for j in JOINTS:
-                    self.driver.set_angle(self.channel_of[j], targets[j])
+                    last[j] = None
+                time.sleep(0.05)
+                continue
+            for j in JOINTS:
+                ch = self.channel_of[j]
+                tgt = targets[j]
+                if tgt != last[j]:
+                    # This joint's target moved: drive it, restart its timer.
+                    last[j] = tgt
+                    settled[j] = now
+                    self.driver.set_angle(ch, tgt)
+                elif j in HOLD_JOINTS:
+                    self.driver.set_angle(ch, tgt)          # always hold
+                elif IDLE_RELEASE_S > 0 and (now - settled[j]) > IDLE_RELEASE_S:
+                    self.driver.release(ch)                 # settled: go quiet
+                else:
+                    self.driver.set_angle(ch, tgt)          # hold during settle
             time.sleep(0.05)
 
     def publish_loop(self):
