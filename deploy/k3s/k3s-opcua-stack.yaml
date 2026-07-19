@@ -185,6 +185,11 @@ metadata:
     tier: agent
 spec:
   replicas: 1
+  # The agent claims fixed GPIO lines via lgpio, so only one pod may run on the
+  # node at a time; Recreate stops the old pod before starting the new one
+  # (a rolling update would leave the new pod unable to claim the GPIOs).
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: pi-agent

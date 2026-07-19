@@ -73,6 +73,9 @@ class ServoDriver:
         self.angle_max = angle_max
         self._lgpio = None
         self._handle = None
+        # Last pulse width (us) sent per channel; None means "released". Used to
+        # avoid re-issuing an unchanged pulse train (which makes servos jitter).
+        self._last_us = {ch: None for ch in channels}
         try:
             import lgpio
             self._handle, chip = _open_header_chip(lgpio)
@@ -92,14 +95,25 @@ class ServoDriver:
 
     def set_angle(self, channel, angle):
         angle = max(self.angle_min, min(self.angle_max, angle))
+        us = self._angle_to_us(angle)
+        # Only act when the pulse actually changes. lgpio emits a continuous
+        # train from one tx_servo call, so re-sending the same width every
+        # control-loop tick would restart the waveform and make the servo
+        # twitch even when the target is unchanged.
+        if self._last_us.get(channel) == us:
+            return angle
+        self._last_us[channel] = us
         if self._lgpio is not None:
-            self._lgpio.tx_servo(self._handle, channel, self._angle_to_us(angle))
+            self._lgpio.tx_servo(self._handle, channel, us)
         else:
             log.info("[mock] pin %s -> %.1f deg", channel, angle)
         return angle
 
     def release(self, channel):
         """Pulse width 0 stops the servo pulses so it goes limp (safe-stop)."""
+        if self._last_us.get(channel) == 0:
+            return
+        self._last_us[channel] = 0
         if self._lgpio is not None:
             self._lgpio.tx_servo(self._handle, channel, 0)
         else:
