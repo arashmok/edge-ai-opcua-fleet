@@ -44,6 +44,10 @@ from ua_pubsub import encode, decode, DSW_STATE, DSW_COMMAND
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("gateway")
+# asyncua logs every Read/Write request at INFO, which floods the log with the
+# OT client's polling. Keep its protocol chatter at WARNING so our own semantic
+# lines (target changes, safe_stop, liveness) are what you actually see.
+logging.getLogger("asyncua").setLevel(logging.WARNING)
 
 PORT = int(os.getenv("OPCUA_PORT", "4840"))
 MQTT_HOST = os.getenv("MQTT_HOST", "mqtt-broker")
@@ -68,6 +72,9 @@ class Gateway:
         self.cmd_seq = {robot: 0 for robot in ROBOTS}
         # monotonic timestamp of the last decoded state per robot; 0 => never
         self.last_state = {robot: 0.0 for robot in ROBOTS}
+        # last commanded target / safe_stop seen, so we log only real changes
+        self.last_targets = {}
+        self.last_stop = {}
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
                                   client_id="fleet-gateway")
         self.client.on_connect = self._on_connect
@@ -146,9 +153,20 @@ class Gateway:
             fleet_stop = await self.fleet_stop_node.read_value()
             for robot in ROBOTS:
                 robot_stop = await self.robot_stop_nodes[robot].read_value()
-                fields = {"safe_stop": bool(fleet_stop or robot_stop)}
+                stop = bool(fleet_stop or robot_stop)
+                fields = {"safe_stop": stop}
+                if self.last_stop.get(robot) != stop:
+                    log.info("OPC UA safe_stop  %s  ->  %s", robot, stop)
+                    self.last_stop[robot] = stop
                 for joint in JOINTS:
-                    fields[joint] = float(await self.target_nodes[(robot, joint)].read_value())
+                    val = float(await self.target_nodes[(robot, joint)].read_value())
+                    fields[joint] = val
+                    prev = self.last_targets.get((robot, joint))
+                    if prev is None or abs(prev - val) > 1e-9:
+                        if prev is not None:
+                            log.info("OPC UA target  %s/%s  %.1f -> %.1f",
+                                     robot, joint, prev, val)
+                        self.last_targets[(robot, joint)] = val
                 self.cmd_seq[robot] += 1
                 payload = encode(publisher_id="fleet-gateway",
                                  dataset_writer_id=DSW_COMMAND,
