@@ -370,8 +370,11 @@ const tgt = { ...cur };
 window.updateArm3D = (a) => {
   if(!a) return;
   const g = (v,d)=> (v===undefined||v===null||isNaN(v)) ? d : Number(v);
+  // Shoulder joint limit: below PITCH_MIN the upper arm would swing down into
+  // the base/turntable, which no real shoulder can do. Clamp the rendered pose.
+  const PITCH_MIN = 56;
   tgt.yaw   = d2r(g(a.base,90) - 90);        // base -> yaw about Y
-  tgt.pitch = d2r(180 - g(a.pitch,90));      // higher pitch -> arm more upright
+  tgt.pitch = d2r(180 - Math.max(g(a.pitch,90), PITCH_MIN)); // higher pitch -> more upright
   tgt.elbow = d2r(180 - g(a.reach,90));      // reach -> forearm bend (relative)
   tgt.jaw   = 0.03 + (g(a.gripper,90)/180) * 0.22; // gripper -> jaw gap
 };
