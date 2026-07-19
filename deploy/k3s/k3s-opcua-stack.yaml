@@ -196,7 +196,9 @@ spec:
     spec:
       nodeSelector:
         role: arm                 # pin to the Pi
-      hostNetwork: true           # allows consistent serial device access
+      # No hostNetwork: the agent only opens an outbound MQTT connection, so a
+      # normal pod IP + cluster DNS is enough to resolve the mqtt-broker Service.
+      # (GPIO access comes from privileged below, not from the host network.)
       containers:
         - name: pi-agent
           image: your-registry/pi-agent:latest
@@ -208,15 +210,7 @@ spec:
             - name: ROBOT_ID
               value: "arm1"
           securityContext:
-            privileged: true      # needed to reach the USB/serial device
-          volumeMounts:
-            - name: arm-serial
-              mountPath: /dev/ttyUSB0
-      volumes:
-        - name: arm-serial
-          hostPath:
-            path: /dev/ttyUSB0    # change if your arm enumerates elsewhere
-            type: CharDevice
+            privileged: true      # gives lgpio access to the host /dev/gpiochip* devices
 
 ---
 # =============================================================================
