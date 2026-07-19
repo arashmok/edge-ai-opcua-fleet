@@ -18,8 +18,13 @@ Env (all optional):
 """
 
 import os
+import time
+import socket
 import asyncio
 import contextlib
+from collections import deque
+from datetime import datetime
+from urllib.parse import urlsplit
 
 from asyncua import Client, ua
 from fastapi import FastAPI
@@ -33,6 +38,10 @@ NS_URI = os.getenv("OPCUA_NS", "http://fleet.local")
 ANGLE_MIN = float(os.getenv("ANGLE_MIN", "0"))
 ANGLE_MAX = float(os.getenv("ANGLE_MAX", "180"))
 
+_u = urlsplit(OPCUA_URL)
+GW_HOST = _u.hostname or "localhost"
+GW_PORT = _u.port or 4840
+
 
 class Fleet:
     """A single, lazily-connected asyncua client with auto-reconnect. All access
@@ -45,6 +54,40 @@ class Fleet:
         self._online = None
         self._stop = None
         self._lock = asyncio.Lock()
+        self._ns_idx = None
+        self._meta = []          # [{path, node, nodeid, dtype}] for introspection
+        self._log = deque(maxlen=60)
+        self._counters = {"reads": 0, "writes": 0, "errors": 0, "reconnects": 0}
+        self._connected_since = None
+        self._last_read_ms = None
+
+    def _log_event(self, op, detail, status):
+        self._log.appendleft({"ts": datetime.now().strftime("%H:%M:%S"),
+                              "op": op, "detail": detail, "status": status})
+
+    def recent_log(self):
+        return list(self._log)
+
+    async def _build_meta(self):
+        """Read the static attributes (NodeId, DataType) of every node once so the
+        telemetry table can show real OPC UA metadata without re-reading them."""
+        meta = []
+
+        async def add(path, node):
+            if node is None:
+                return
+            try:
+                dtype = (await node.read_data_type_as_variant_type()).name
+            except Exception:  # noqa: BLE001
+                dtype = "?"
+            meta.append({"path": path, "node": node,
+                         "nodeid": node.nodeid.to_string(), "dtype": dtype})
+        for j in JOINTS:
+            await add(f"{ROBOT}/{j}/target", self._targets[j])
+            await add(f"{ROBOT}/{j}/state", self._states[j])
+        await add(f"{ROBOT}/safe_stop", self._stop)
+        await add(f"{ROBOT}/online", self._online)
+        self._meta = meta
 
     async def _connect(self):
         client = Client(OPCUA_URL, timeout=5)
@@ -63,6 +106,10 @@ class Fleet:
         except Exception:  # noqa: BLE001 - older gateway without liveness node
             self._online = None
         self._client = client
+        self._ns_idx = idx
+        await self._build_meta()
+        self._connected_since = time.time()
+        self._log_event("SESSION", f"connected {OPCUA_URL}", "Good")
 
     async def _reset(self):
         client, self._client = self._client, None
@@ -77,8 +124,11 @@ class Fleet:
                 await self._connect()
             try:
                 return await op()
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
+                self._counters["errors"] += 1
+                self._log_event("ERROR", str(exc)[:90], "Bad")
                 await self._reset()
+                self._counters["reconnects"] += 1
                 await self._connect()
                 return await op()
 
@@ -89,6 +139,8 @@ class Fleet:
             await self._targets[joint].write_value(
                 ua.Variant(angle, ua.VariantType.Double))
         await self._run(op)
+        self._counters["writes"] += 1
+        self._log_event("WRITE", f"{ROBOT}/{joint}/target = {angle:.0f}", "Good")
         return angle
 
     async def set_stop(self, on):
@@ -96,6 +148,8 @@ class Fleet:
             await self._stop.write_value(
                 ua.Variant(bool(on), ua.VariantType.Boolean))
         await self._run(op)
+        self._counters["writes"] += 1
+        self._log_event("WRITE", f"{ROBOT}/safe_stop = {bool(on)}", "Good")
 
     async def snapshot(self):
         async def op():
@@ -109,6 +163,59 @@ class Fleet:
             return {"state": state, "target": target, "online": online,
                     "safe_stop": bool(await self._stop.read_value())}
         return await self._run(op)
+
+    async def nodes_detail(self):
+        """Read every node as a full DataValue: value, StatusCode and the server /
+        source timestamps, i.e. the actual OPC UA message content per node."""
+        async def op():
+            rows = []
+            t0 = time.perf_counter()
+            for m in self._meta:
+                dv = await m["node"].read_data_value()
+                val = dv.Value.Value if dv.Value is not None else None
+                if isinstance(val, float):
+                    val = round(val, 1)
+                good = dv.StatusCode.is_good() if dv.StatusCode is not None else True
+                ts = dv.SourceTimestamp or dv.ServerTimestamp
+                rows.append({
+                    "path": m["path"], "nodeid": m["nodeid"], "dtype": m["dtype"],
+                    "value": val, "status": "Good" if good else "Bad",
+                    "updated": ts.strftime("%H:%M:%S.%f")[:-3] if ts else "\u2014"})
+            self._last_read_ms = round((time.perf_counter() - t0) * 1000, 1)
+            self._counters["reads"] += 1
+            return rows
+        return await self._run(op)
+
+    async def diag(self):
+        """Network + session diagnostics: DNS resolution, TCP reachability/RTT to
+        the OPC UA endpoint, namespace, latency and operation counters."""
+        ip, dns_err = None, None
+        try:
+            ip = socket.gethostbyname(GW_HOST)
+        except Exception as exc:  # noqa: BLE001
+            dns_err = str(exc)
+        rtt_ms, tcp_ok = None, False
+        try:
+            t0 = time.perf_counter()
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(GW_HOST, GW_PORT), timeout=3)
+            rtt_ms = round((time.perf_counter() - t0) * 1000, 1)
+            tcp_ok = True
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+        except Exception:  # noqa: BLE001
+            pass
+        up = int(time.time() - self._connected_since) if self._connected_since else None
+        return {
+            "endpoint": OPCUA_URL, "host": GW_HOST, "port": GW_PORT,
+            "resolved_ip": ip, "dns_error": dns_err,
+            "tcp_ok": tcp_ok, "tcp_rtt_ms": rtt_ms,
+            "ns_index": self._ns_idx, "ns_uri": NS_URI,
+            "session": "connected" if self._client is not None else "disconnected",
+            "uptime_s": up, "read_latency_ms": self._last_read_ms,
+            "counters": dict(self._counters),
+        }
 
 
 fleet = Fleet()
@@ -152,6 +259,16 @@ async def api_safe_stop(req: StopReq):
     return {"safe_stop": req.on}
 
 
+@app.get("/api/telemetry")
+async def api_telemetry():
+    try:
+        nodes = await fleet.nodes_detail()
+        diag = await fleet.diag()
+        return {"nodes": nodes, "log": fleet.recent_log(), "diag": diag}
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": str(exc)}, status_code=503)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return PAGE.replace("__ENDPOINT__", OPCUA_URL).replace("__ROBOT__", ROBOT)
@@ -167,7 +284,7 @@ PAGE = """<!doctype html>
   :root{--bg:#0f1420;--card:#1a2233;--fg:#e6ebf5;--mut:#8a97b1;--acc:#4f8cff;--ok:#28c76f;--bad:#ff4d4f;}
   *{box-sizing:border-box;}
   body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg);}
-  .wrap{max-width:680px;margin:0 auto;padding:24px 16px 48px;}
+  .wrap{max-width:880px;margin:0 auto;padding:24px 16px 48px;}
   h1{font-size:20px;margin:0 0 4px;}
   .sub{color:var(--mut);font-size:13px;margin-bottom:20px;word-break:break-all;}
   .card{background:var(--card);border-radius:14px;padding:16px 18px;margin-bottom:14px;}
@@ -192,6 +309,23 @@ PAGE = """<!doctype html>
     box-shadow:0 6px 20px rgba(0,0,0,.4);z-index:5;}
   .viz.off .offbadge{display:block;}
   .hint{color:var(--mut);font-size:11px;margin-top:6px;text-align:center;}
+  h2{font-size:14px;margin:0 0 10px;}
+  .grid2{display:grid;grid-template-columns:1fr;gap:14px;}
+  @media(min-width:760px){.grid2{grid-template-columns:1fr 1fr;}}
+  .tbl{width:100%;border-collapse:collapse;font-size:12px;}
+  .tbl th,.tbl td{text-align:left;padding:6px 8px;border-bottom:1px solid #24304a;white-space:nowrap;}
+  .tbl th{color:var(--mut);font-weight:600;position:sticky;top:0;background:var(--card);}
+  .tbl td.num{text-align:right;font-variant-numeric:tabular-nums;}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#9ec2ff;}
+  .pill{display:inline-block;padding:1px 7px;border-radius:8px;font-size:11px;font-weight:600;}
+  .pill.good{background:rgba(40,199,111,.15);color:var(--ok);}
+  .pill.bad{background:rgba(255,77,79,.15);color:var(--bad);}
+  .scroll{max-height:230px;overflow:auto;}
+  .log{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;line-height:1.75;max-height:210px;overflow:auto;}
+  .log .t{color:var(--mut);} .log .w{color:#ffd166;} .log .r{color:#6ba0ff;}
+  .log .e{color:var(--bad);} .log .s{color:var(--ok);}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:5px 14px;font-size:12.5px;align-items:baseline;}
+  .kv .k{color:var(--mut);} .kv .v{font-variant-numeric:tabular-nums;word-break:break-all;}
 </style>
 </head>
 <body>
@@ -211,6 +345,37 @@ PAGE = """<!doctype html>
       <button class="btn-stop" id="stopBtn" onclick="toggleStop()">SAFE-STOP</button>
     </div>
     <div class="status" id="status">—</div>
+  </div>
+  <h2 style="margin:22px 2px 12px">Edge diagnostics</h2>
+  <div class="grid2">
+    <div class="card">
+      <h2>OPC UA nodes <span class="sub" style="font-weight:400">· live DataValues</span></h2>
+      <div class="scroll"><table class="tbl"><thead><tr>
+        <th>Node</th><th>NodeId</th><th>Type</th><th>Value</th><th>Status</th><th>Updated</th>
+      </tr></thead><tbody id="nodesBody"><tr><td colspan="6">…</td></tr></tbody></table></div>
+    </div>
+    <div class="card">
+      <h2>Link diagnostics</h2>
+      <div class="kv" id="diagKv"><div class="k">…</div><div class="v"></div></div>
+    </div>
+  </div>
+  <div class="grid2">
+    <div class="card">
+      <h2>OPC UA activity log</h2>
+      <div class="log" id="logBox">…</div>
+    </div>
+    <div class="card">
+      <h2>Edge stack topology</h2>
+      <div class="kv">
+        <div class="k">Orchestration</div><div class="v">k3s (lightweight Kubernetes)</div>
+        <div class="k">Control plane</div><div class="v">Pi 5 · role=edge · kube-apiserver / etcd / scheduler / kubelet</div>
+        <div class="k">Worker node</div><div class="v">Pi 4 · role=arm · kubelet / kube-proxy</div>
+        <div class="k">Namespace</div><div class="v mono">edge-opcua</div>
+        <div class="k">South bus</div><div class="v">MQTT (eclipse-mosquitto) · OPC UA PubSub JSON, Part 14</div>
+        <div class="k">Gateway</div><div class="v">single OPC UA server endpoint (north / OT side)</div>
+        <div class="k">Field I/O</div><div class="v">lgpio software PWM → SG90 servos (base / pitch / reach / gripper)</div>
+      </div>
+    </div>
   </div>
 </div>
 <script>
@@ -271,8 +436,36 @@ async function poll(){
 async function centerAll(){ for(const j of joints){ try{await setJoint(j,90);}catch(e){} } }
 async function toggleStop(){ try{ await api('/api/safe_stop',{method:'POST',
   headers:{'Content-Type':'application/json'},body:JSON.stringify({on:!stopOn})}); }catch(e){} poll(); }
+function pill(s){ return `<span class="pill ${s==='Good'?'good':'bad'}">${s}</span>`; }
+async function pollTelemetry(){
+  try{
+    const t=await api('/api/telemetry');
+    $('nodesBody').innerHTML=t.nodes.map(n=>`<tr>
+      <td class="mono">${n.path}</td>
+      <td class="mono">${n.nodeid}</td>
+      <td>${n.dtype}</td>
+      <td class="num">${n.value}</td>
+      <td>${pill(n.status)}</td>
+      <td style="color:var(--mut)">${n.updated}</td></tr>`).join('');
+    const d=t.diag, c=d.counters||{};
+    $('diagKv').innerHTML=`
+      <div class="k">Endpoint</div><div class="v mono">${d.endpoint}</div>
+      <div class="k">Host → IP (DNS)</div><div class="v mono">${d.host} → ${d.resolved_ip||d.dns_error||'—'}</div>
+      <div class="k">TCP :${d.port}</div><div class="v">${d.tcp_ok?('reachable · '+d.tcp_rtt_ms+' ms'):'unreachable'}</div>
+      <div class="k">OPC UA session</div><div class="v">${d.session}${d.uptime_s!=null?(' · up '+d.uptime_s+'s'):''}</div>
+      <div class="k">Namespace</div><div class="v mono">ns=${d.ns_index} (${d.ns_uri})</div>
+      <div class="k">Read latency</div><div class="v">${d.read_latency_ms!=null?d.read_latency_ms+' ms':'—'}</div>
+      <div class="k">Reads / Writes</div><div class="v">${c.reads||0} / ${c.writes||0}</div>
+      <div class="k">Errors / Reconnects</div><div class="v">${c.errors||0} / ${c.reconnects||0}</div>`;
+    $('logBox').innerHTML=t.log.map(l=>{
+      const cls=l.op==='WRITE'?'w':l.op==='ERROR'?'e':l.op==='SESSION'?'s':'r';
+      const sc=l.status==='Good'?'s':'e';
+      return `<div><span class="t">${l.ts}</span> <span class="${cls}">${l.op}</span> ${l.detail} <span class="${sc}">${l.status}</span></div>`;
+    }).join('') || '<div class="t">no activity yet</div>';
+  }catch(e){ /* diagnostics are best-effort */ }
+}
 (async()=>{ try{await build();}catch(e){ $('joints').textContent='cannot reach gateway: '+e.message; }
-  setInterval(poll,800); })();
+  setInterval(poll,800); setInterval(pollTelemetry,1500); pollTelemetry(); })();
 </script>
 <script type="importmap">
 { "imports": {
