@@ -309,6 +309,17 @@ PAGE = """<!doctype html>
     box-shadow:0 6px 20px rgba(0,0,0,.4);z-index:5;}
   .viz.off .offbadge{display:block;}
   .hint{color:var(--mut);font-size:11px;margin-top:6px;text-align:center;}
+  .vizrow{display:grid;grid-template-columns:1fr;gap:14px;align-items:stretch;}
+  @media(min-width:720px){.vizrow{grid-template-columns:245px 1fr;}}
+  .scenewrap{position:relative;}
+  .flow{display:flex;flex-direction:column;font-size:11.5px;}
+  .flowtitle{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;}
+  .fnode{background:#1e2740;border:1px solid #2e3b59;border-left-width:3px;border-radius:9px;padding:8px 10px;font-weight:700;}
+  .fnode span{display:block;font-weight:400;color:var(--mut);font-size:10.5px;margin-top:2px;}
+  .fnode.client{border-left-color:#4f8cff;} .fnode.gw{border-left-color:#6ba0ff;}
+  .fnode.agent{border-left-color:#28c76f;} .fnode.servo{border-left-color:#ffd166;}
+  .fedge{color:var(--mut);font-size:10px;text-align:center;padding:5px 0;line-height:1.55;}
+  .fedge b{display:block;color:#9ec2ff;font-weight:600;}
   h2{font-size:14px;margin:0 0 10px;}
   .grid2{display:grid;grid-template-columns:1fr;gap:14px;}
   @media(min-width:760px){.grid2{grid-template-columns:1fr 1fr;}}
@@ -334,9 +345,23 @@ PAGE = """<!doctype html>
   <div class="sub">OPC UA endpoint: __ENDPOINT__</div>
   <div class="card viz">
     <div class="cap"><span>Live arm (3D · mirrors reported state)</span><span id="vizHealth"></span></div>
-    <div class="scene" id="scene"></div>
-    <div class="offbadge">ARM OFFLINE</div>
-    <div class="hint">drag to orbit · scroll to zoom</div>
+    <div class="vizrow">
+      <div class="flow">
+        <div class="flowtitle">Signal path</div>
+        <div class="fnode client">OT Client<span>this page · browser</span></div>
+        <div class="fedge">⇅<b>OPC UA · opc.tcp :4840</b>write target / read state</div>
+        <div class="fnode gw">Spark Gateway<span>OPC UA server · pi5 (role=edge)</span></div>
+        <div class="fedge">⇅<b>MQTT · OPC UA PubSub JSON (Part 14)</b>fleet/arm1/cmd · /state</div>
+        <div class="fnode agent">Pi Agent — arm1<span>robo-arm (role=arm) · MQTT client</span></div>
+        <div class="fedge">↓<b>lgpio · software PWM</b>50 Hz · GPIO 17/27/22/23</div>
+        <div class="fnode servo">SG90 Servos<span>base · pitch · reach · gripper</span></div>
+      </div>
+      <div class="scenewrap">
+        <div class="scene" id="scene"></div>
+        <div class="offbadge">ARM OFFLINE</div>
+        <div class="hint">drag to orbit · scroll to zoom</div>
+      </div>
+    </div>
   </div>
   <div class="card" id="joints">connecting…</div>
   <div class="card">
